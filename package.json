@@ -25,7 +25,9 @@
     "@slack/bolt": "^4.3.0",
     "@slack/types": "^2.15.0",
     "better-sqlite3": "11.10.0",
-    "cron-parser": "5.5.0"
+    "cron-parser": "5.5.0",
+    "google-auth-library": "^9.15.1",
+    "googleapis": "^146.0.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.35.0",
