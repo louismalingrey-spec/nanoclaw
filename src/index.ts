@@ -5,6 +5,7 @@ import { OneCLI } from '@onecli-sh/sdk';
 
 import {
   ASSISTANT_NAME,
+  CREDENTIAL_PROXY_PORT,
   DEFAULT_TRIGGER,
   getTriggerPattern,
   GROUPS_DIR,
@@ -61,10 +62,13 @@ import {
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
+import { startCredentialProxy } from './credential-proxy.js';
 import { startSessionCleanup } from './session-cleanup.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { GBRAIN_PROXY_PORT } from './config.js';
+import { startGbrainProxy } from './gbrain-proxy.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -568,7 +572,36 @@ function ensureContainerSystemRunning(): void {
   cleanupOrphans();
 }
 
+async function tryStartGbrainProxy(): Promise<void> {
+  const os = await import('os');
+  const candidates = [
+    process.env.GBRAIN_BIN,
+    path.join(os.homedir(), '.bun', 'bin', 'gbrain'),
+    '/usr/local/bin/gbrain',
+    '/opt/homebrew/bin/gbrain',
+  ].filter((p): p is string => !!p);
+
+  const gbrainBin = candidates.find((p) => fs.existsSync(p));
+  if (!gbrainBin) {
+    logger.info('gbrain binary not found, brain integration disabled');
+    return;
+  }
+
+  try {
+    await startGbrainProxy(
+      GBRAIN_PROXY_PORT,
+      gbrainBin,
+      process.env.CREDENTIAL_PROXY_HOST,
+    );
+    process.env.GBRAIN_PROXY_PORT = String(GBRAIN_PROXY_PORT);
+  } catch (err) {
+    logger.warn({ err }, 'Failed to start gbrain proxy');
+  }
+}
+
 async function main(): Promise<void> {
+  await startCredentialProxy(CREDENTIAL_PROXY_PORT, process.env.CREDENTIAL_PROXY_HOST);
+  await tryStartGbrainProxy();
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');

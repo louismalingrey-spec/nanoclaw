@@ -3,7 +3,12 @@
     "network": {
       "allowedDomains": [
         "npm.registry.com",
-        "us.i.posthog.com"
+        "us.i.posthog.com",
+        "api.notion.com",
+        "viral.app",
+        "app.sideshift.app",
+        "slack.com",
+        "api.openai.com"
       ]
     }
   }

@@ -261,6 +261,14 @@ function buildContainerArgs(
     `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
   );
 
+  // GBrain proxy: if running, expose it to the container via the host gateway
+  if (process.env.GBRAIN_PROXY_PORT) {
+    args.push(
+      '-e',
+      `GBRAIN_PROXY_URL=http://${CONTAINER_HOST_GATEWAY}:${process.env.GBRAIN_PROXY_PORT}/tool`,
+    );
+  }
+
   // Mirror the host's auth method with a placeholder value.
   // API key mode: SDK sends x-api-key, proxy replaces with real key.
   // OAuth mode:   SDK exchanges placeholder token for temp API key,

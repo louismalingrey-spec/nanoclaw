@@ -22,6 +22,20 @@ import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 
 /**
+ * Returns true for transient API failures that are worth retrying
+ * (overloaded, rate-limited, container timeout).
+ */
+function isTransientError(error: string | null, result: string | null): boolean {
+  const haystack = `${error ?? ''} ${result ?? ''}`.toLowerCase();
+  return (
+    haystack.includes('529') ||
+    haystack.includes('overloaded') ||
+    haystack.includes('rate_limit') ||
+    haystack.includes('timed out')
+  );
+}
+
+/**
  * Compute the next run time for a recurring task, anchored to the
  * task's scheduled time rather than Date.now() to prevent cumulative
  * drift on interval-based tasks.
@@ -231,7 +245,23 @@ async function runTask(
     error,
   });
 
-  const nextRun = computeNextRun(task);
+  // On transient errors (API overloaded, timeout), retry in 30 min instead of
+  // skipping to the next scheduled occurrence — but stop retrying after 20:00.
+  const RETRY_MS = 30 * 60 * 1000;
+  const RETRY_CUTOFF_HOUR = 20;
+  let nextRun = computeNextRun(task);
+  if (error !== null && isTransientError(error, result) && task.schedule_type !== 'once') {
+    const retryAt = new Date(Date.now() + RETRY_MS);
+    const cutoff = new Date(retryAt);
+    cutoff.setHours(RETRY_CUTOFF_HOUR, 0, 0, 0);
+    if (retryAt < cutoff) {
+      nextRun = retryAt.toISOString();
+      logger.info(
+        { taskId: task.id, retryAt: nextRun },
+        'Transient error — scheduling retry in 30 min',
+      );
+    }
+  }
   const resultSummary = error
     ? `Error: ${error}`
     : result

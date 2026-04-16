@@ -470,6 +470,7 @@ async function runQuery(
         'NotebookEdit',
         'mcp__nanoclaw__*',
         'mcp__gmail__*',
+        'mcp__gbrain__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -489,6 +490,17 @@ async function runQuery(
           command: 'npx',
           args: ['-y', '@gongrzhe/server-gmail-autoauth-mcp'],
         },
+        ...(process.env.GBRAIN_PROXY_URL
+          ? {
+              gbrain: {
+                command: 'node',
+                args: [gbrainMcpServerPath],
+                env: {
+                  GBRAIN_PROXY_URL: process.env.GBRAIN_PROXY_URL,
+                },
+              },
+            }
+          : {}),
       },
       hooks: {
         PreCompact: [
@@ -635,6 +647,7 @@ async function main(): Promise<void> {
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
+  const gbrainMcpServerPath = path.join(__dirname, 'gbrain-mcp-stdio.js');
 
   let sessionId = containerInput.sessionId;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
