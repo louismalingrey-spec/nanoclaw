@@ -5,6 +5,7 @@
  */
 import { ChildProcess, execSync, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
@@ -20,7 +21,7 @@ import {
   TIMEZONE,
 } from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
-import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import { CONTAINER_HOST_GATEWAY, CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -264,6 +265,13 @@ function buildMounts(
   const sessDir = sessionDir(agentGroup.id, session.id);
   const groupDir = path.resolve(GROUPS_DIR, agentGroup.folder);
 
+  // Apple Container does NOT auto-create the image's WORKDIR (/workspace/group)
+  // when /workspace is mounted from the host. The image's pre-existing
+  // /workspace/group dir gets hidden by the mount overlay, so we must create it
+  // host-side or the container fails with "failed to change directory" before
+  // entrypoint runs. Docker auto-creates missing WORKDIRs; Apple Container does not.
+  fs.mkdirSync(path.join(sessDir, 'group'), { recursive: true });
+
   // Session folder at /workspace (contains inbound.db, outbound.db, outbox/, .claude/)
   mounts.push({ hostPath: sessDir, containerPath: '/workspace', readonly: false });
 
@@ -271,23 +279,15 @@ function buildMounts(
   mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });
 
   // container.json — nested RO mount on top of RW group dir so the agent
-  // can read its config but cannot modify it.
-  const containerJsonPath = path.join(groupDir, 'container.json');
-  if (fs.existsSync(containerJsonPath)) {
-    mounts.push({ hostPath: containerJsonPath, containerPath: '/workspace/agent/container.json', readonly: true });
-  }
+  // Note: container.json and CLAUDE.md are NOT separately mounted RO here.
+  // Apple Container (macOS) doesn't support individual file bind mounts.
+  // Both files are accessible via the RW group dir mount at /workspace/agent.
+  // container.json:  accessible at /workspace/agent/container.json (via group dir)
+  // CLAUDE.md:       accessible at /workspace/agent/CLAUDE.md (via group dir)
+  // .claude-shared.md: written as a regular file by composeGroupClaudeMd (not a symlink)
+  //                    so no /app/CLAUDE.md mount is needed.
 
-  // Composer-managed CLAUDE.md artifacts — nested RO mounts. These are
-  // regenerated from the shared base + fragments on every spawn; any
-  // agent-side writes would be clobbered, so enforce read-only. Only
-  // CLAUDE.local.md (per-group memory) remains RW via the group-dir mount.
-  // `.claude-shared.md` is a symlink whose target (`/app/CLAUDE.md`) is
-  // already RO-mounted, so writes through it fail regardless — no need for
-  // a nested mount there.
-  const composedClaudeMd = path.join(groupDir, 'CLAUDE.md');
-  if (fs.existsSync(composedClaudeMd)) {
-    mounts.push({ hostPath: composedClaudeMd, containerPath: '/workspace/agent/CLAUDE.md', readonly: true });
-  }
+  // .claude-fragments is a directory — directory mounts work in Apple Container.
   const fragmentsDir = path.join(groupDir, '.claude-fragments');
   if (fs.existsSync(fragmentsDir)) {
     mounts.push({ hostPath: fragmentsDir, containerPath: '/workspace/agent/.claude-fragments', readonly: true });
@@ -297,13 +297,6 @@ function buildMounts(
   const globalDir = path.join(GROUPS_DIR, 'global');
   if (fs.existsSync(globalDir)) {
     mounts.push({ hostPath: globalDir, containerPath: '/workspace/global', readonly: true });
-  }
-
-  // Shared CLAUDE.md — read-only, imported by the composed entry point via
-  // the `.claude-shared.md` symlink inside the group dir.
-  const sharedClaudeMd = path.join(process.cwd(), 'container', 'CLAUDE.md');
-  if (fs.existsSync(sharedClaudeMd)) {
-    mounts.push({ hostPath: sharedClaudeMd, containerPath: '/app/CLAUDE.md', readonly: true });
   }
 
   // Per-group .claude-shared at /home/node/.claude (Claude state, settings,
@@ -424,6 +417,72 @@ function ensureRuntimeFields(
   }
 }
 
+/**
+ * Patch args produced by onecli.applyContainerConfig() for Apple Container.
+ *
+ * Apple Container differences from Docker:
+ * - Only directory bind mounts (not individual file mounts). OneCLI mounts CA
+ *   cert files directly; we copy them to a temp dir and mount that instead.
+ * - No host.docker.internal alias. Replace with the actual bridge gateway IP.
+ */
+function patchArgsForAppleContainer(args: string[], hostGateway: string): void {
+  const fileMountIndices: number[] = [];
+  const pathMap = new Map<string, string>(); // old container path → new
+
+  // First pass: find file mounts and collect them
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] === '-v') {
+      const parts = args[i + 1].split(':');
+      if (parts.length >= 2 && fs.existsSync(parts[0]) && fs.statSync(parts[0]).isFile()) {
+        fileMountIndices.push(i + 1);
+      }
+    }
+  }
+
+  if (fileMountIndices.length > 0) {
+    // Copy all cert files into a single temp dir, mount the dir once
+    const certDir = path.join(os.tmpdir(), `nanoclaw-onecli-certs-${Date.now()}`);
+    fs.mkdirSync(certDir, { recursive: true });
+
+    let dirMountInserted = false;
+    for (const idx of fileMountIndices) {
+      const parts = args[idx].split(':');
+      const hostFile = parts[0];
+      const containerPath = parts[1];
+      const fileName = path.basename(hostFile);
+      fs.copyFileSync(hostFile, path.join(certDir, fileName));
+      const newContainerPath = `/tmp/nanoclaw-onecli-certs/${fileName}`;
+      pathMap.set(containerPath, newContainerPath);
+
+      if (!dirMountInserted) {
+        args[idx] = `${certDir}:/tmp/nanoclaw-onecli-certs:ro`;
+        dirMountInserted = true;
+      } else {
+        // Mark for removal — duplicate dir mount
+        args[idx - 1] = '__NC_REMOVE__';
+        args[idx] = '__NC_REMOVE__';
+      }
+    }
+
+    // Remove marked entries (iterate in reverse to preserve indices)
+    for (let i = args.length - 1; i >= 0; i--) {
+      if (args[i] === '__NC_REMOVE__') args.splice(i, 1);
+    }
+  }
+
+  // Second pass: fix env vars — replace host.docker.internal and stale cert paths
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] === '-e') {
+      let val = args[i + 1];
+      val = val.replaceAll('host.docker.internal', hostGateway);
+      for (const [oldPath, newPath] of pathMap) {
+        val = val.replaceAll(oldPath, newPath);
+      }
+      args[i + 1] = val;
+    }
+  }
+}
+
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -460,6 +519,16 @@ async function buildContainerArgs(
   }
   log.info('OneCLI gateway applied', { containerName });
 
+  // Apple Container compatibility: fix OneCLI-injected args.
+  // 1. Replace host.docker.internal with the actual bridge gateway IP — Apple Container
+  //    has no Docker-style host alias; containers reach the host via bridge100.
+  // 2. Convert file -v mounts to a directory mount — Apple Container only supports
+  //    directory bind mounts (not individual file mounts like Docker).
+  patchArgsForAppleContainer(args, CONTAINER_HOST_GATEWAY);
+
+  // GBrain proxy — inject URL so agents can call brain tools
+  args.push('-e', `GBRAIN_PROXY_URL=http://${CONTAINER_HOST_GATEWAY}:3002/tool`);
+
   // Host gateway
   args.push(...hostGatewayArgs());
 
@@ -479,6 +548,10 @@ async function buildContainerArgs(
       args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
     }
   }
+
+  // Apple Container enforces the image's WORKDIR even when that dir is replaced
+  // by a bind mount. Override to /workspace which is always present (session mount).
+  args.push('--workdir', '/workspace');
 
   // Override entrypoint: run v2 entry point directly via Bun (no tsc, no stdin).
   args.push('--entrypoint', 'bash');
