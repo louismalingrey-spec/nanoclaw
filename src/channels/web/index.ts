@@ -44,7 +44,14 @@ import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { openInboundDb, openOutboundDb } from '../../session-manager.js';
 import { canAccessAgentGroup } from '../../modules/permissions/access.js';
 import { createUser, getUser } from '../../modules/permissions/db/users.js';
-import { createWebSession, getWebSession, touchWebSession } from '../../db/web.js';
+import {
+  createWebSession,
+  getWebApp,
+  getWebSession,
+  listWebAppsByAgentGroup,
+  touchWebSession,
+} from '../../db/web.js';
+import { closeAllSandboxes, getSandboxDb, isReadOnlySql } from '../../db/web-sandbox.js';
 import type { ChannelAdapter, ChannelSetup, InboundMessage, OutboundMessage } from '../adapter.js';
 import { registerChannelAdapter } from '../channel-registry.js';
 import type { ClientFrame, RequestFrame, ResponseFrame, ServerFrame } from './protocol.js';
@@ -178,6 +185,9 @@ function createAdapter(): ChannelAdapter | null {
         httpServer = null;
       }
       subscribers.clear();
+      // Release the sandbox DB handles we accumulated while serving;
+      // other modules may have opened their own too, close() is idempotent.
+      closeAllSandboxes();
     },
 
     isConnected(): boolean {
@@ -861,8 +871,91 @@ async function handleRpc(
         return;
       }
 
-      // Subsequent phases add apps.*, artifacts.*, notifications.*,
-      // crons.list, db.query, and agent.* as more `case` branches here.
+      case 'apps.list': {
+        const params = req.params as { agent_group_id?: string } | undefined;
+        if (!params?.agent_group_id) {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'agent_group_id required' });
+          return;
+        }
+        if (!canAccessAgentGroup(userId, params.agent_group_id).allowed) {
+          respond(ws, req.id, false, undefined, { code: 'forbidden', message: 'No access' });
+          return;
+        }
+        respond(ws, req.id, true, {
+          apps: listWebAppsByAgentGroup(params.agent_group_id).map((a) => ({
+            id: a.id,
+            agent_group_id: a.agent_group_id,
+            name: a.name,
+            updated_at: a.updated_at,
+          })),
+        });
+        return;
+      }
+
+      case 'apps.get': {
+        const params = req.params as { id?: string } | undefined;
+        if (!params?.id) {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'id required' });
+          return;
+        }
+        const app = getWebApp(params.id);
+        if (!app) {
+          respond(ws, req.id, false, undefined, { code: 'not-found', message: 'App not found' });
+          return;
+        }
+        if (!canAccessAgentGroup(userId, app.agent_group_id).allowed) {
+          respond(ws, req.id, false, undefined, { code: 'forbidden', message: 'No access' });
+          return;
+        }
+        respond(ws, req.id, true, app);
+        return;
+      }
+
+      case 'db.query': {
+        const params = req.params as {
+          agent_group_id?: string;
+          q?: string;
+          params?: unknown[] | Record<string, unknown>;
+        } | undefined;
+        if (!params?.agent_group_id || typeof params.q !== 'string') {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'agent_group_id and q required' });
+          return;
+        }
+        if (!canAccessAgentGroup(userId, params.agent_group_id).allowed) {
+          respond(ws, req.id, false, undefined, { code: 'forbidden', message: 'No access' });
+          return;
+        }
+        if (!isReadOnlySql(params.q)) {
+          respond(ws, req.id, false, undefined, {
+            code: 'write-blocked',
+            message:
+              'Only SELECT / WITH / PRAGMA / EXPLAIN are allowed over db.query. Use db_execute on the agent side for writes.',
+          });
+          return;
+        }
+        try {
+          const db = getSandboxDb(params.agent_group_id);
+          const stmt = db.prepare(params.q);
+          let rows: unknown[];
+          if (Array.isArray(params.params)) {
+            rows = stmt.all(...params.params);
+          } else if (params.params && typeof params.params === 'object') {
+            rows = stmt.all(params.params as Record<string, unknown>);
+          } else {
+            rows = stmt.all();
+          }
+          respond(ws, req.id, true, { rows });
+        } catch (err) {
+          respond(ws, req.id, false, undefined, {
+            code: 'sql-error',
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+        return;
+      }
+
+      // Subsequent phases add artifacts.*, notifications.*, crons.list,
+      // and agent.* as more `case` branches here.
 
       default:
         respond(ws, req.id, false, undefined, { code: 'unknown-method', message: `Unknown method: ${req.method}` });

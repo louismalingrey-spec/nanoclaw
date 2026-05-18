@@ -4,8 +4,9 @@ import { NanoClawEngine, type ConnectionState } from "./engine";
 import { Login } from "./views/Login";
 import { Sidebar } from "./views/Sidebar";
 import { Thread } from "./views/Thread";
+import { AppPanel } from "./views/AppPanel";
 import { loadSettings, saveSettings, clearSettings, type Settings } from "./storage";
-import type { Agent, SessionPreview } from "./protocol";
+import type { Agent, AppSummary, SessionPreview } from "./protocol";
 
 function wsUrl(): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -48,6 +49,8 @@ export function App() {
   const [activeAgent, setActiveAgent] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SessionPreview[]>([]);
   const [activeSession, setActiveSession] = useState<string | null>(null);
+  const [apps, setApps] = useState<AppSummary[]>([]);
+  const [activeApp, setActiveApp] = useState<string | null>(null);
   useResolvedTheme(settings.theme);
 
   const engine = useMemo(() => {
@@ -87,16 +90,24 @@ export function App() {
   useEffect(() => {
     if (!engine || !activeAgent) {
       setSessions([]);
+      setApps([]);
       return;
     }
     let cancelled = false;
+    const loadApps = () =>
+      engine.listApps(activeAgent).then((a) => {
+        if (!cancelled) setApps(a);
+      });
     void engine.listSessions(activeAgent).then((s) => {
       if (cancelled) return;
       setSessions(s);
       setActiveSession((prev) => prev ?? (s.length > 0 ? s[0].id : null));
     });
+    void loadApps();
+    const off = engine.on("app.changed", () => void loadApps());
     return () => {
       cancelled = true;
+      off();
     };
   }, [engine, activeAgent]);
 
@@ -105,6 +116,7 @@ export function App() {
   // session id.
   useEffect(() => {
     setActiveSession(null);
+    setActiveApp(null);
   }, [activeAgent]);
 
   if (!settings.token) {
@@ -123,7 +135,7 @@ export function App() {
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: "260px 1fr",
+        gridTemplateColumns: activeApp ? "260px 1fr 1fr" : "260px 1fr",
         height: "100vh",
         background: "var(--ncl-bg)",
         color: "var(--ncl-fg)",
@@ -136,6 +148,9 @@ export function App() {
         sessions={sessions}
         activeSession={activeSession}
         onSelectSession={setActiveSession}
+        apps={apps}
+        activeApp={activeApp}
+        onOpenApp={setActiveApp}
         state={state}
         userId={settings.userId}
         onLogout={() => {
@@ -145,6 +160,8 @@ export function App() {
           setActiveAgent(null);
           setSessions([]);
           setActiveSession(null);
+          setApps([]);
+          setActiveApp(null);
         }}
       />
       <main
@@ -177,6 +194,9 @@ export function App() {
           </div>
         )}
       </main>
+      {engine && activeApp && (
+        <AppPanel engine={engine} appId={activeApp} onClose={() => setActiveApp(null)} />
+      )}
     </div>
   );
 }

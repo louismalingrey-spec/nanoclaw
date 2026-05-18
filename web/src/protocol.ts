@@ -80,3 +80,21 @@ export interface ChatFinalEvent {
   content: unknown;
   ts: string;
 }
+
+export interface AppSummary {
+  id: string;
+  agent_group_id: string;
+  name: string;
+  updated_at: string;
+}
+
+export interface AppFull extends AppSummary {
+  code: string;
+  created_at: string;
+}
+
+export interface AppChangedEvent {
+  app_id: string;
+  name: string;
+  updated_at: string;
+}

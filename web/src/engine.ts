@@ -11,11 +11,13 @@
  */
 import type {
   Agent,
+  AppChangedEvent,
+  AppFull,
+  AppSummary,
   ChatFinalEvent,
   ClientFrame,
   EventFrame,
   HistoryMessage,
-  RequestFrame,
   ServerFrame,
   SessionPreview,
 } from "./protocol";
@@ -30,6 +32,11 @@ export interface EngineEvents {
   authed: { user_id: string };
   "chat.final": ChatFinalEvent;
   "chat.typing": { agent_group_id: string; ts: string };
+  "app.changed": AppChangedEvent;
+  /** Sandbox DB rows changed for this agent group — refresh open Query()s. */
+  "db.changed": { changes: number };
+  /** Sandbox DB write failed on the host. Surfaced as a small warning. */
+  "db.error": { sql: string; message: string };
   error: { code: string; message: string };
 }
 
@@ -121,6 +128,24 @@ export class NanoClawEngine {
     await this.request("chat.subscribe", { agent_group_id: agentGroupId });
   }
 
+  async listApps(agentGroupId: string): Promise<AppSummary[]> {
+    const r = (await this.request("apps.list", { agent_group_id: agentGroupId })) as { apps: AppSummary[] };
+    return r.apps;
+  }
+
+  async getApp(id: string): Promise<AppFull> {
+    return (await this.request("apps.get", { id })) as AppFull;
+  }
+
+  async dbQuery(
+    agentGroupId: string,
+    q: string,
+    params?: unknown[] | Record<string, unknown>,
+  ): Promise<unknown[]> {
+    const r = (await this.request("db.query", { agent_group_id: agentGroupId, q, params })) as { rows: unknown[] };
+    return r.rows;
+  }
+
   // ── internals ──────────────────────────────────────────────────────────
 
   private setState(s: ConnectionState): void {
@@ -194,6 +219,12 @@ export class NanoClawEngine {
         this.emit("chat.final", evt.payload as ChatFinalEvent);
       } else if (evt.event === "chat.typing") {
         this.emit("chat.typing", evt.payload as { agent_group_id: string; ts: string });
+      } else if (evt.event === "app.changed") {
+        this.emit("app.changed", evt.payload as AppChangedEvent);
+      } else if (evt.event === "db.changed") {
+        this.emit("db.changed", evt.payload as { changes: number });
+      } else if (evt.event === "db.error") {
+        this.emit("db.error", evt.payload as { sql: string; message: string });
       } else if (evt.event === "error") {
         this.emit("error", evt.payload as { code: string; message: string });
       } else {

@@ -1,4 +1,4 @@
-import type { Agent, SessionPreview } from "../protocol";
+import type { Agent, AppSummary, SessionPreview } from "../protocol";
 import type { ConnectionState } from "../engine";
 import { ConversationsSection } from "./ConversationsSection";
 
@@ -9,6 +9,9 @@ export function Sidebar({
   sessions,
   activeSession,
   onSelectSession,
+  apps,
+  activeApp,
+  onOpenApp,
   state,
   userId,
   onLogout,
@@ -19,6 +22,9 @@ export function Sidebar({
   sessions: SessionPreview[];
   activeSession: string | null;
   onSelectSession: (sessionId: string | null) => void;
+  apps: AppSummary[];
+  activeApp: string | null;
+  onOpenApp: (id: string) => void;
   state: ConnectionState;
   userId: string | null;
   onLogout: () => void;
@@ -107,6 +113,51 @@ export function Sidebar({
         />
       )}
 
+      {activeAgent && (
+        <>
+          <div
+            style={{
+              fontSize: 11,
+              textTransform: "uppercase",
+              letterSpacing: 0.5,
+              color: "var(--ncl-faint)",
+              padding: "16px 8px 4px",
+            }}
+          >
+            Apps
+          </div>
+          {apps.length === 0 ? (
+            <div style={{ padding: "4px 8px", fontSize: 12, color: "var(--ncl-faint)" }}>None yet.</div>
+          ) : (
+            apps.map((a) => {
+              const active = a.id === activeApp;
+              return (
+                <button
+                  key={a.id}
+                  onClick={() => onOpenApp(a.id)}
+                  style={{
+                    textAlign: "left",
+                    padding: "6px 10px",
+                    borderRadius: 6,
+                    border: "1px solid " + (active ? "var(--ncl-accent)" : "transparent"),
+                    background: active ? "var(--ncl-accent-bg)" : "transparent",
+                    cursor: "pointer",
+                    fontSize: 12,
+                    color: "inherit",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 1,
+                  }}
+                >
+                  <span style={{ fontWeight: 500 }}>{a.name}</span>
+                  <span style={{ fontSize: 10, color: "var(--ncl-faint)" }}>{relTime(a.updated_at)}</span>
+                </button>
+              );
+            })
+          )}
+        </>
+      )}
+
       <div style={{ marginTop: "auto", padding: "8px 4px 0" }}>
         <button
           onClick={onLogout}
@@ -140,6 +191,16 @@ function StateDot({ state }: { state: ConnectionState }) {
   return (
     <span style={{ width: 8, height: 8, borderRadius: 4, background: color, display: "inline-block" }} />
   );
+}
+
+function relTime(iso: string): string {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "";
+  const diff = (Date.now() - t) / 1000;
+  if (diff < 60) return "just now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return new Date(t).toLocaleDateString();
 }
 
 function stateLabel(s: ConnectionState): string {
