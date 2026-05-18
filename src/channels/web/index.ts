@@ -33,15 +33,13 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import { readEnvFile } from '../../env.js';
 import { log } from '../../log.js';
 import { getAllAgentGroups } from '../../db/agent-groups.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
+import { openInboundDb, openOutboundDb } from '../../session-manager.js';
 import { canAccessAgentGroup } from '../../modules/permissions/access.js';
 import { createUser, getUser } from '../../modules/permissions/db/users.js';
 import { createWebSession, getWebSession, touchWebSession } from '../../db/web.js';
-import type {
-  ChannelAdapter,
-  ChannelSetup,
-  OutboundMessage,
-} from '../adapter.js';
+import type { ChannelAdapter, ChannelSetup, OutboundMessage } from '../adapter.js';
 import { registerChannelAdapter } from '../channel-registry.js';
 import type { ClientFrame, RequestFrame, ResponseFrame, ServerFrame } from './protocol.js';
 
@@ -239,6 +237,234 @@ function createAdapter(): ChannelAdapter | null {
   };
 
   return adapter;
+}
+
+// ── Session previews + chat history readers ──────────────────────────────
+
+interface SessionPreviewRow {
+  id: string;
+  agent_group_id: string;
+  thread_id: string | null;
+  status: string;
+  container_status: string;
+  last_active: string | null;
+  created_at: string;
+  channel_type: string | null;
+  /** Best-effort label — first user message or thread_id fallback. */
+  title: string;
+  /** Most recent message text (in or out), trimmed for preview. */
+  last_preview: string;
+  /** Most recent activity timestamp across in + out. */
+  last_at: string;
+  /** Total chat-kind messages (in + out). */
+  message_count: number;
+}
+
+/** Walk each session's two DBs to derive a human-readable summary. One
+ *  inbound + outbound DB open per session; we accept that cost because
+ *  sessions per agent_group are O(tens) for any realistic install.
+ *
+ *  Defensive: a missing or corrupt DB surfaces with empty preview rather
+ *  than crashing the whole `sessions.list` reply. */
+function readSessionPreviews(
+  agentGroupId: string,
+  sessions: ReturnType<typeof getSessionsByAgentGroup>,
+): SessionPreviewRow[] {
+  const out: SessionPreviewRow[] = [];
+  for (const s of sessions) {
+    const mg = s.messaging_group_id
+      ? (() => {
+          try {
+            return getMessagingGroup(s.messaging_group_id!) ?? null;
+          } catch {
+            return null;
+          }
+        })()
+      : null;
+
+    let firstUserText = '';
+    let lastText = '';
+    let lastAt = s.last_active ?? s.created_at;
+    let msgCount = 0;
+
+    let inDb: ReturnType<typeof openInboundDb> | null = null;
+    try {
+      inDb = openInboundDb(agentGroupId, s.id);
+      const rows = inDb
+        .prepare(
+          `SELECT content, timestamp FROM messages_in
+           WHERE kind IN ('chat', 'chat-sdk') AND COALESCE(status, '') != 'paused'
+           ORDER BY seq ASC`,
+        )
+        .all() as Array<{ content: string; timestamp: string }>;
+      rows.forEach((r, i) => {
+        const t = extractText(r.content);
+        if (i === 0 && t) firstUserText = t;
+        if (t) {
+          lastText = t;
+          if (r.timestamp > lastAt) lastAt = r.timestamp;
+        }
+      });
+      msgCount += rows.length;
+    } catch {
+      // inbound DB missing — fine, we'll just show what we have
+    } finally {
+      inDb?.close();
+    }
+
+    let outDb: ReturnType<typeof openOutboundDb> | null = null;
+    try {
+      outDb = openOutboundDb(agentGroupId, s.id);
+      const rows = outDb
+        .prepare(`SELECT content, timestamp FROM messages_out WHERE kind = 'chat' ORDER BY seq ASC`)
+        .all() as Array<{ content: string; timestamp: string }>;
+      for (const r of rows) {
+        const t = extractText(r.content);
+        if (t) {
+          lastText = t;
+          if (r.timestamp > lastAt) lastAt = r.timestamp;
+        }
+      }
+      msgCount += rows.length;
+    } catch {
+      // outbound DB missing — same
+    } finally {
+      outDb?.close();
+    }
+
+    // Title heuristic: prefer the user's opening line; fall back to a
+    // suffix of the platform thread id; last resort, the session's
+    // created_at as a local date string.
+    const title = firstUserText
+      ? firstUserText.slice(0, 80)
+      : s.thread_id
+        ? `thread ${s.thread_id.slice(-12)}`
+        : new Date(s.created_at).toLocaleString();
+
+    out.push({
+      id: s.id,
+      agent_group_id: s.agent_group_id,
+      thread_id: s.thread_id ?? null,
+      status: s.status ?? 'active',
+      container_status: s.container_status ?? 'stopped',
+      last_active: s.last_active ?? null,
+      created_at: s.created_at,
+      channel_type: mg?.channel_type ?? null,
+      title,
+      last_preview: lastText.slice(0, 140),
+      last_at: lastAt,
+      message_count: msgCount,
+    });
+  }
+  // Most recent first — matches Claude.ai's "recent conversations" pattern.
+  out.sort((a, b) => (a.last_at < b.last_at ? 1 : a.last_at > b.last_at ? -1 : 0));
+  return out;
+}
+
+interface HistoryRow {
+  id: string;
+  role: 'user' | 'assistant';
+  timestamp: string;
+  kind: string;
+  text: string;
+  content: unknown;
+  session_id: string;
+  channel_type: string | null;
+  sender: string | null;
+}
+
+/** Merge messages_in + messages_out of one or all sessions into a single
+ *  chronological transcript. If `sessionIdFilter` is set, only that
+ *  session is read; otherwise we aggregate across every session of the
+ *  agent_group (the "All conversations" view).
+ *
+ *  Per-session caps prevent a chatty session from drowning out the rest
+ *  when aggregating; single-session reads pull the full limit. */
+function readChatHistory(agentGroupId: string, limit: number, sessionIdFilter?: string): HistoryRow[] {
+  const all = getSessionsByAgentGroup(agentGroupId);
+  const sessions = sessionIdFilter ? all.filter((s) => s.id === sessionIdFilter) : all;
+  const perSession = sessionIdFilter ? limit : Math.min(limit, 200);
+  const merged: HistoryRow[] = [];
+
+  type Row = { id: string; kind: string; timestamp: string; content: string; channel_type: string | null };
+  const tag = (rows: Row[], role: 'user' | 'assistant', sessionId: string): HistoryRow[] =>
+    rows.map((r) => {
+      let parsed: unknown = r.content;
+      let text = '';
+      let sender: string | null = null;
+      try {
+        parsed = JSON.parse(r.content);
+        const obj = parsed as Record<string, unknown>;
+        if (typeof obj.text === 'string') text = obj.text;
+        if (typeof obj.sender === 'string') sender = obj.sender;
+        else if (typeof obj.senderName === 'string') sender = obj.senderName;
+      } catch {
+        text = r.content;
+      }
+      return {
+        id: r.id,
+        role,
+        timestamp: r.timestamp,
+        kind: r.kind,
+        text,
+        content: parsed,
+        session_id: sessionId,
+        channel_type: r.channel_type,
+        sender,
+      };
+    });
+
+  for (const session of sessions) {
+    let inDb: ReturnType<typeof openInboundDb> | null = null;
+    try {
+      inDb = openInboundDb(agentGroupId, session.id);
+      const userRows = inDb
+        .prepare(
+          `SELECT id, kind, timestamp, content, channel_type FROM messages_in
+           WHERE kind IN ('chat', 'chat-sdk')
+           ORDER BY seq DESC LIMIT ?`,
+        )
+        .all(perSession) as Row[];
+      merged.push(...tag(userRows, 'user', session.id));
+    } catch (err) {
+      log.debug('readChatHistory: inbound open failed', { sessionId: session.id, err });
+    } finally {
+      inDb?.close();
+    }
+
+    let outDb: ReturnType<typeof openOutboundDb> | null = null;
+    try {
+      outDb = openOutboundDb(agentGroupId, session.id);
+      const rows = outDb
+        .prepare(
+          `SELECT id, kind, timestamp, content, channel_type FROM messages_out
+           WHERE kind = 'chat'
+           ORDER BY seq DESC LIMIT ?`,
+        )
+        .all(perSession) as Row[];
+      merged.push(...tag(rows, 'assistant', session.id));
+    } catch (err) {
+      log.debug('readChatHistory: outbound open failed', { sessionId: session.id, err });
+    } finally {
+      outDb?.close();
+    }
+  }
+
+  // Sort ascending by timestamp so the UI renders oldest-first; cap to
+  // `limit` AFTER merge so genuinely recent rows always win even if a
+  // single session was capped earlier.
+  merged.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
+  return merged.slice(-limit);
+}
+
+function extractText(raw: string): string {
+  try {
+    const obj = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof obj.text === 'string') return obj.text;
+  } catch {
+    return raw;
+  }
+  return '';
 }
 
 // ── HTTP routing (static UI + auth) ──────────────────────────────────────
@@ -495,9 +721,43 @@ async function handleRpc(
         return;
       }
 
-      // More methods (sessions.list, chat.history, chat.send, apps.list, …)
-      // get added in subsequent phases. Each lives as a `case` here and
-      // delegates to a small reader function below.
+      case 'sessions.list': {
+        const params = req.params as { agent_group_id?: string } | undefined;
+        if (!params?.agent_group_id) {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'agent_group_id required' });
+          return;
+        }
+        if (!canAccessAgentGroup(userId, params.agent_group_id).allowed) {
+          respond(ws, req.id, false, undefined, { code: 'forbidden', message: 'No access to this agent group' });
+          return;
+        }
+        const sessions = getSessionsByAgentGroup(params.agent_group_id);
+        respond(ws, req.id, true, { sessions: readSessionPreviews(params.agent_group_id, sessions) });
+        return;
+      }
+
+      case 'chat.history': {
+        const params = req.params as { agent_group_id?: string; session_id?: string; limit?: number } | undefined;
+        if (!params?.agent_group_id) {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'agent_group_id required' });
+          return;
+        }
+        if (!canAccessAgentGroup(userId, params.agent_group_id).allowed) {
+          respond(ws, req.id, false, undefined, { code: 'forbidden', message: 'No access' });
+          return;
+        }
+        const limit = Math.min(typeof params.limit === 'number' ? params.limit : 200, 500);
+        // Two modes: session_id given → single thread; omitted → aggregated.
+        // This is the difference between "show me THIS conversation" and
+        // "show me everything I've ever said to this agent."
+        const messages = readChatHistory(params.agent_group_id, limit, params.session_id);
+        respond(ws, req.id, true, { messages });
+        return;
+      }
+
+      // More methods (chat.send, apps.list, …) get added in subsequent
+      // phases. Each lives as a `case` here and delegates to a small
+      // reader function above.
 
       default:
         respond(ws, req.id, false, undefined, { code: 'unknown-method', message: `Unknown method: ${req.method}` });
