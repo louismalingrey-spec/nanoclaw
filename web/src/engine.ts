@@ -168,6 +168,19 @@ export class NanoClawEngine {
   private connect(): void {
     if (this.stopped) return;
     this.setState("connecting");
+    // Close any prior socket cleanly before opening a new one. React
+    // StrictMode double-mounts effects in dev, so without this guard
+    // we'd end up with two concurrent WebSockets racing each other —
+    // their onclose handlers would re-trigger reconnect and the engine
+    // would flap.
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {
+        // swallow
+      }
+      this.ws = null;
+    }
     let ws: WebSocket;
     try {
       ws = new WebSocket(this.url);
@@ -177,15 +190,25 @@ export class NanoClawEngine {
       return;
     }
     this.ws = ws;
-    ws.onopen = () => this.handleOpen();
-    ws.onmessage = (e) => this.handleMessage(typeof e.data === "string" ? e.data : "");
-    ws.onclose = (e) => this.handleClose(e.code);
-    ws.onerror = (e) => console.warn("[engine] ws error", e);
-  }
-
-  private handleOpen(): void {
-    if (!this.ws) return;
-    this.ws.send(JSON.stringify({ type: "auth", token: this.token } satisfies ClientFrame));
+    // Bind handlers that capture THIS ws and ignore events from stale
+    // instances. Required because the browser fires onclose on any
+    // dangling socket whose handlers we already moved on from.
+    ws.onopen = () => {
+      if (this.ws !== ws) return;
+      ws.send(JSON.stringify({ type: "auth", token: this.token } satisfies ClientFrame));
+    };
+    ws.onmessage = (e) => {
+      if (this.ws !== ws) return;
+      this.handleMessage(typeof e.data === "string" ? e.data : "");
+    };
+    ws.onclose = (e) => {
+      if (this.ws !== ws) return; // ignore stale close
+      this.handleClose(e.code);
+    };
+    ws.onerror = (e) => {
+      if (this.ws !== ws) return;
+      console.warn("[engine] ws error", e);
+    };
   }
 
   private handleMessage(raw: string): void {
