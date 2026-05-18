@@ -32,14 +32,20 @@ import { WebSocketServer, type WebSocket } from 'ws';
 
 import { readEnvFile } from '../../env.js';
 import { log } from '../../log.js';
-import { getAllAgentGroups } from '../../db/agent-groups.js';
-import { getMessagingGroup } from '../../db/messaging-groups.js';
+import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
+import {
+  createMessagingGroup,
+  createMessagingGroupAgent,
+  getMessagingGroup,
+  getMessagingGroupAgentByPair,
+  getMessagingGroupByPlatform,
+} from '../../db/messaging-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { openInboundDb, openOutboundDb } from '../../session-manager.js';
 import { canAccessAgentGroup } from '../../modules/permissions/access.js';
 import { createUser, getUser } from '../../modules/permissions/db/users.js';
 import { createWebSession, getWebSession, touchWebSession } from '../../db/web.js';
-import type { ChannelAdapter, ChannelSetup, OutboundMessage } from '../adapter.js';
+import type { ChannelAdapter, ChannelSetup, InboundMessage, OutboundMessage } from '../adapter.js';
 import { registerChannelAdapter } from '../channel-registry.js';
 import type { ClientFrame, RequestFrame, ResponseFrame, ServerFrame } from './protocol.js';
 
@@ -700,8 +706,8 @@ function respond(
 async function handleRpc(
   socket: AuthedSocket,
   req: RequestFrame,
-  _config: ChannelSetup,
-  _subscribe: (platformId: string, s: AuthedSocket) => void,
+  config: ChannelSetup,
+  subscribe: (platformId: string, s: AuthedSocket) => void,
 ): Promise<void> {
   const { ws, userId } = socket;
   try {
@@ -755,9 +761,108 @@ async function handleRpc(
         return;
       }
 
-      // More methods (chat.send, apps.list, …) get added in subsequent
-      // phases. Each lives as a `case` here and delegates to a small
-      // reader function above.
+      case 'chat.send': {
+        const params = req.params as { agent_group_id?: string; text?: string } | undefined;
+        if (!params?.agent_group_id || typeof params.text !== 'string') {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'agent_group_id and text required' });
+          return;
+        }
+        if (!canAccessAgentGroup(userId, params.agent_group_id).allowed) {
+          respond(ws, req.id, false, undefined, { code: 'forbidden', message: 'No access to this agent group' });
+          return;
+        }
+        const agent = getAgentGroup(params.agent_group_id);
+        if (!agent) {
+          respond(ws, req.id, false, undefined, { code: 'not-found', message: 'Agent group not found' });
+          return;
+        }
+
+        const platformId = platformIdFor(userId, params.agent_group_id);
+
+        // Lazy-create the messaging_group + wiring on first message —
+        // saves a round-trip at auth time and keeps the central DB clean
+        // for users who only ever read history without sending.
+        let mg = getMessagingGroupByPlatform(CHANNEL_TYPE, platformId);
+        if (!mg) {
+          mg = {
+            id: `mg-web-${randomBytes(6).toString('hex')}`,
+            channel_type: CHANNEL_TYPE,
+            platform_id: platformId,
+            name: agent.name,
+            is_group: 0,
+            // Web sockets are bearer-token authed — the holder's user_id is
+            // trusted, so no `request_approval` gate needed for strangers.
+            unknown_sender_policy: 'public',
+            denied_at: null,
+            created_at: new Date().toISOString(),
+          };
+          createMessagingGroup(mg);
+          log.info('Web channel: created messaging group', {
+            mgId: mg.id,
+            userId,
+            agentGroupId: params.agent_group_id,
+          });
+        }
+        if (!getMessagingGroupAgentByPair(mg.id, params.agent_group_id)) {
+          createMessagingGroupAgent({
+            id: `mga-web-${randomBytes(6).toString('hex')}`,
+            messaging_group_id: mg.id,
+            agent_group_id: params.agent_group_id,
+            // Web is a 1:1 DM — the user is always addressing this agent.
+            // `pattern` + `.` matches every message.
+            engage_mode: 'pattern',
+            engage_pattern: '.',
+            sender_scope: 'all',
+            ignored_message_policy: 'drop',
+            session_mode: 'shared',
+            priority: 0,
+            created_at: new Date().toISOString(),
+          });
+        }
+
+        // Auto-subscribe — sending a message means the user is interested
+        // in the reply. The UI can ALSO call chat.subscribe explicitly to
+        // re-attach to a session it's just opened from history.
+        subscribe(platformId, socket);
+
+        const messageId = `web-${Date.now()}-${randomBytes(4).toString('hex')}`;
+        const inbound: InboundMessage = {
+          id: messageId,
+          kind: 'chat',
+          timestamp: new Date().toISOString(),
+          isMention: true,
+          isGroup: false,
+          content: {
+            text: params.text,
+            sender: userId,
+            senderId: userId,
+          },
+        };
+        await config.onInbound(platformId, null, inbound);
+        respond(ws, req.id, true, { message_id: messageId });
+        return;
+      }
+
+      case 'chat.subscribe': {
+        // Idempotent — join this socket to an agent's outbound stream
+        // without sending. The UI calls this on thread-open so subsequent
+        // assistant replies arrive over `event:chat.final`.
+        const params = req.params as { agent_group_id?: string } | undefined;
+        if (!params?.agent_group_id) {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'agent_group_id required' });
+          return;
+        }
+        if (!canAccessAgentGroup(userId, params.agent_group_id).allowed) {
+          respond(ws, req.id, false, undefined, { code: 'forbidden', message: 'No access' });
+          return;
+        }
+        subscribe(platformIdFor(userId, params.agent_group_id), socket);
+        respond(ws, req.id, true, { subscribed: true });
+        return;
+      }
+
+      // Subsequent phases add apps.*, artifacts.*, notifications.*,
+      // crons.list, db.query, and agent.* as more `case` branches here.
 
       default:
         respond(ws, req.id, false, undefined, { code: 'unknown-method', message: `Unknown method: ${req.method}` });
