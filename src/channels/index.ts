@@ -7,3 +7,5 @@
 // self-registration import below.
 
 import './cli.js';
+import './slack.js';
+import './web/index.js';
