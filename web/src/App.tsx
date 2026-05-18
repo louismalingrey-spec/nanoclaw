@@ -5,8 +5,18 @@ import { Login } from "./views/Login";
 import { Sidebar } from "./views/Sidebar";
 import { Thread } from "./views/Thread";
 import { AppPanel } from "./views/AppPanel";
+import { ArtifactPanel } from "./views/ArtifactPanel";
+import { NotificationsDrawer } from "./views/NotificationsDrawer";
+import { SettingsDialog } from "./views/SettingsDialog";
 import { loadSettings, saveSettings, clearSettings, type Settings } from "./storage";
-import type { Agent, AppSummary, SessionPreview } from "./protocol";
+import type {
+  Agent,
+  AppSummary,
+  ArtifactSummary,
+  CronEntry,
+  NotificationEntry,
+  SessionPreview,
+} from "./protocol";
 
 function wsUrl(): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -51,6 +61,13 @@ export function App() {
   const [activeSession, setActiveSession] = useState<string | null>(null);
   const [apps, setApps] = useState<AppSummary[]>([]);
   const [activeApp, setActiveApp] = useState<string | null>(null);
+  const [artifacts, setArtifacts] = useState<ArtifactSummary[]>([]);
+  const [activeArtifact, setActiveArtifact] = useState<string | null>(null);
+  const [crons, setCrons] = useState<CronEntry[]>([]);
+  const [notifications, setNotifications] = useState<NotificationEntry[]>([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   useResolvedTheme(settings.theme);
 
   const engine = useMemo(() => {
@@ -91,6 +108,10 @@ export function App() {
     if (!engine || !activeAgent) {
       setSessions([]);
       setApps([]);
+      setArtifacts([]);
+      setCrons([]);
+      setNotifications([]);
+      setUnreadCount(0);
       return;
     }
     let cancelled = false;
@@ -98,16 +119,43 @@ export function App() {
       engine.listApps(activeAgent).then((a) => {
         if (!cancelled) setApps(a);
       });
+    const loadArtifacts = () =>
+      engine.listArtifacts(activeAgent).then((a) => {
+        if (!cancelled) setArtifacts(a);
+      });
+    const loadCrons = () =>
+      engine.listCrons(activeAgent).then((c) => {
+        if (!cancelled) setCrons(c);
+      });
+    const loadNotifications = () =>
+      engine.listNotifications(activeAgent).then(({ notifications, unread }) => {
+        if (cancelled) return;
+        setNotifications(notifications);
+        setUnreadCount(unread);
+      });
     void engine.listSessions(activeAgent).then((s) => {
       if (cancelled) return;
       setSessions(s);
       setActiveSession((prev) => prev ?? (s.length > 0 ? s[0].id : null));
     });
     void loadApps();
-    const off = engine.on("app.changed", () => void loadApps());
+    void loadArtifacts();
+    void loadCrons();
+    void loadNotifications();
+    // Refresh crons periodically — no event fires for newly-scheduled tasks.
+    const cronTimer = setInterval(() => void loadCrons(), 60_000);
+    const offs = [
+      engine.on("app.changed", () => {
+        void loadApps();
+        void loadCrons();
+      }),
+      engine.on("artifact.changed", () => void loadArtifacts()),
+      engine.on("notification.new", () => void loadNotifications()),
+    ];
     return () => {
       cancelled = true;
-      off();
+      clearInterval(cronTimer);
+      offs.forEach((u) => u());
     };
   }, [engine, activeAgent]);
 
@@ -117,7 +165,18 @@ export function App() {
   useEffect(() => {
     setActiveSession(null);
     setActiveApp(null);
+    setActiveArtifact(null);
   }, [activeAgent]);
+
+  // Apps + artifacts share the right-side slot; opening one closes the other.
+  function openApp(id: string) {
+    setActiveArtifact(null);
+    setActiveApp(id);
+  }
+  function openArtifact(id: string) {
+    setActiveApp(null);
+    setActiveArtifact(id);
+  }
 
   if (!settings.token) {
     return (
@@ -135,7 +194,7 @@ export function App() {
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: activeApp ? "260px 1fr 1fr" : "260px 1fr",
+        gridTemplateColumns: activeApp || activeArtifact ? "260px 1fr 1fr" : "260px 1fr",
         height: "100vh",
         background: "var(--ncl-bg)",
         color: "var(--ncl-fg)",
@@ -150,7 +209,14 @@ export function App() {
         onSelectSession={setActiveSession}
         apps={apps}
         activeApp={activeApp}
-        onOpenApp={setActiveApp}
+        onOpenApp={openApp}
+        artifacts={artifacts}
+        activeArtifact={activeArtifact}
+        onOpenArtifact={openArtifact}
+        crons={crons}
+        unreadCount={unreadCount}
+        onOpenNotifications={() => setDrawerOpen(true)}
+        onOpenSettings={() => setSettingsOpen(true)}
         state={state}
         userId={settings.userId}
         onLogout={() => {
@@ -162,6 +228,11 @@ export function App() {
           setActiveSession(null);
           setApps([]);
           setActiveApp(null);
+          setArtifacts([]);
+          setActiveArtifact(null);
+          setCrons([]);
+          setNotifications([]);
+          setUnreadCount(0);
         }}
       />
       <main
@@ -196,6 +267,57 @@ export function App() {
       </main>
       {engine && activeApp && (
         <AppPanel engine={engine} appId={activeApp} onClose={() => setActiveApp(null)} />
+      )}
+      {engine && activeArtifact && (
+        <ArtifactPanel
+          engine={engine}
+          artifactId={activeArtifact}
+          onClose={() => setActiveArtifact(null)}
+        />
+      )}
+      {engine && drawerOpen && activeAgent && (
+        <NotificationsDrawer
+          engine={engine}
+          agentGroupId={activeAgent}
+          notifications={notifications}
+          onClose={() => setDrawerOpen(false)}
+          onChange={() => {
+            void engine.listNotifications(activeAgent).then(({ notifications, unread }) => {
+              setNotifications(notifications);
+              setUnreadCount(unread);
+            });
+          }}
+        />
+      )}
+      {engine && settingsOpen && (
+        <SettingsDialog
+          engine={engine}
+          agents={agents}
+          userId={settings.userId}
+          theme={settings.theme ?? "system"}
+          onChangeTheme={(t) => {
+            const next = { ...settings, theme: t };
+            setSettings(next);
+            saveSettings(next);
+          }}
+          onClose={() => setSettingsOpen(false)}
+          onSignOut={() => {
+            clearSettings();
+            setSettings({ token: null, userId: null, theme: settings.theme });
+            setAgents([]);
+            setActiveAgent(null);
+            setSessions([]);
+            setActiveSession(null);
+            setApps([]);
+            setActiveApp(null);
+            setArtifacts([]);
+            setActiveArtifact(null);
+            setCrons([]);
+            setNotifications([]);
+            setUnreadCount(0);
+            setSettingsOpen(false);
+          }}
+        />
       )}
     </div>
   );

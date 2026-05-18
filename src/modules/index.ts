@@ -24,3 +24,5 @@ import './agent-to-agent/index.js';
 import './self-mod/index.js';
 import './web-apps/index.js';
 import './web-db/index.js';
+import './web-artifacts/index.js';
+import './web-notifications/index.js';

@@ -45,12 +45,19 @@ import { openInboundDb, openOutboundDb } from '../../session-manager.js';
 import { canAccessAgentGroup } from '../../modules/permissions/access.js';
 import { createUser, getUser } from '../../modules/permissions/db/users.js';
 import {
+  countUnreadNotifications,
   createWebSession,
   getWebApp,
+  getWebArtifact,
   getWebSession,
   listWebAppsByAgentGroup,
+  listWebArtifactsByAgentGroup,
+  listWebNotificationsByAgentGroup,
+  markAllNotificationsRead,
+  markNotificationRead,
   touchWebSession,
 } from '../../db/web.js';
+import { isContainerRunning, killContainer } from '../../container-runner.js';
 import { closeAllSandboxes, getSandboxDb, isReadOnlySql } from '../../db/web-sandbox.js';
 import type { ChannelAdapter, ChannelSetup, InboundMessage, OutboundMessage } from '../adapter.js';
 import { registerChannelAdapter } from '../channel-registry.js';
@@ -253,6 +260,77 @@ function createAdapter(): ChannelAdapter | null {
   };
 
   return adapter;
+}
+
+// ── Crons reader (scheduled tasks across all sessions of an agent) ───────
+
+interface CronRow {
+  id: string;
+  session_id: string;
+  status: string;
+  recurrence: string | null;
+  process_after: string | null;
+  series_id: string | null;
+  prompt: string;
+  script: string | null;
+  created_at: string;
+}
+
+/** Aggregate live scheduled tasks across an agent_group's sessions.
+ *  Tasks live in each session's `messages_in` as `kind='task'` rows;
+ *  status 'pending' or 'paused' = still on the agenda. */
+function readCrons(agentGroupId: string): CronRow[] {
+  const sessions = getSessionsByAgentGroup(agentGroupId);
+  const out: CronRow[] = [];
+  for (const session of sessions) {
+    let inDb: ReturnType<typeof openInboundDb> | null = null;
+    try {
+      inDb = openInboundDb(agentGroupId, session.id);
+      const rows = inDb
+        .prepare(
+          `SELECT id, status, recurrence, process_after, series_id, content, timestamp
+           FROM messages_in
+           WHERE kind = 'task' AND status IN ('pending', 'paused')
+           ORDER BY COALESCE(process_after, timestamp) ASC`,
+        )
+        .all() as Array<{
+        id: string;
+        status: string;
+        recurrence: string | null;
+        process_after: string | null;
+        series_id: string | null;
+        content: string;
+        timestamp: string;
+      }>;
+      for (const r of rows) {
+        let prompt = '';
+        let script: string | null = null;
+        try {
+          const parsed = JSON.parse(r.content) as { prompt?: string; script?: string };
+          if (typeof parsed.prompt === 'string') prompt = parsed.prompt;
+          if (typeof parsed.script === 'string') script = parsed.script;
+        } catch {
+          prompt = r.content;
+        }
+        out.push({
+          id: r.id,
+          session_id: session.id,
+          status: r.status,
+          recurrence: r.recurrence,
+          process_after: r.process_after,
+          series_id: r.series_id,
+          prompt,
+          script,
+          created_at: r.timestamp,
+        });
+      }
+    } catch {
+      // session DB missing — skip
+    } finally {
+      inDb?.close();
+    }
+  }
+  return out;
 }
 
 // ── Session previews + chat history readers ──────────────────────────────
@@ -912,11 +990,13 @@ async function handleRpc(
       }
 
       case 'db.query': {
-        const params = req.params as {
-          agent_group_id?: string;
-          q?: string;
-          params?: unknown[] | Record<string, unknown>;
-        } | undefined;
+        const params = req.params as
+          | {
+              agent_group_id?: string;
+              q?: string;
+              params?: unknown[] | Record<string, unknown>;
+            }
+          | undefined;
         if (!params?.agent_group_id || typeof params.q !== 'string') {
           respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'agent_group_id and q required' });
           return;
@@ -954,8 +1034,150 @@ async function handleRpc(
         return;
       }
 
-      // Subsequent phases add artifacts.*, notifications.*, crons.list,
-      // and agent.* as more `case` branches here.
+      case 'artifacts.list': {
+        const params = req.params as { agent_group_id?: string } | undefined;
+        if (!params?.agent_group_id) {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'agent_group_id required' });
+          return;
+        }
+        if (!canAccessAgentGroup(userId, params.agent_group_id).allowed) {
+          respond(ws, req.id, false, undefined, { code: 'forbidden', message: 'No access' });
+          return;
+        }
+        respond(ws, req.id, true, {
+          artifacts: listWebArtifactsByAgentGroup(params.agent_group_id).map((a) => ({
+            id: a.id,
+            agent_group_id: a.agent_group_id,
+            name: a.name,
+            kind: a.kind,
+            updated_at: a.updated_at,
+          })),
+        });
+        return;
+      }
+
+      case 'artifacts.get': {
+        const params = req.params as { id?: string } | undefined;
+        if (!params?.id) {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'id required' });
+          return;
+        }
+        const art = getWebArtifact(params.id);
+        if (!art) {
+          respond(ws, req.id, false, undefined, { code: 'not-found', message: 'Artifact not found' });
+          return;
+        }
+        if (!canAccessAgentGroup(userId, art.agent_group_id).allowed) {
+          respond(ws, req.id, false, undefined, { code: 'forbidden', message: 'No access' });
+          return;
+        }
+        respond(ws, req.id, true, art);
+        return;
+      }
+
+      case 'notifications.list': {
+        const params = req.params as { agent_group_id?: string; limit?: number } | undefined;
+        if (!params?.agent_group_id) {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'agent_group_id required' });
+          return;
+        }
+        if (!canAccessAgentGroup(userId, params.agent_group_id).allowed) {
+          respond(ws, req.id, false, undefined, { code: 'forbidden', message: 'No access' });
+          return;
+        }
+        respond(ws, req.id, true, {
+          notifications: listWebNotificationsByAgentGroup(
+            params.agent_group_id,
+            Math.min(typeof params.limit === 'number' ? params.limit : 50, 200),
+          ),
+          unread: countUnreadNotifications(params.agent_group_id),
+        });
+        return;
+      }
+
+      case 'notifications.mark_read': {
+        const params = req.params as { id?: string; agent_group_id?: string; all?: boolean } | undefined;
+        if (!params) {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'params required' });
+          return;
+        }
+        if (params.all) {
+          if (!params.agent_group_id || !canAccessAgentGroup(userId, params.agent_group_id).allowed) {
+            respond(ws, req.id, false, undefined, { code: 'forbidden', message: 'No access' });
+            return;
+          }
+          markAllNotificationsRead(params.agent_group_id, new Date().toISOString());
+          respond(ws, req.id, true, { ok: true });
+          return;
+        }
+        if (!params.id) {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'id required' });
+          return;
+        }
+        markNotificationRead(params.id, new Date().toISOString());
+        respond(ws, req.id, true, { ok: true });
+        return;
+      }
+
+      case 'crons.list': {
+        const params = req.params as { agent_group_id?: string } | undefined;
+        if (!params?.agent_group_id) {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'agent_group_id required' });
+          return;
+        }
+        if (!canAccessAgentGroup(userId, params.agent_group_id).allowed) {
+          respond(ws, req.id, false, undefined, { code: 'forbidden', message: 'No access' });
+          return;
+        }
+        respond(ws, req.id, true, { crons: readCrons(params.agent_group_id) });
+        return;
+      }
+
+      case 'agent.status': {
+        const params = req.params as { agent_group_id?: string } | undefined;
+        if (!params?.agent_group_id) {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'agent_group_id required' });
+          return;
+        }
+        if (!canAccessAgentGroup(userId, params.agent_group_id).allowed) {
+          respond(ws, req.id, false, undefined, { code: 'forbidden', message: 'No access' });
+          return;
+        }
+        const sessions = getSessionsByAgentGroup(params.agent_group_id);
+        respond(ws, req.id, true, {
+          agent_group_id: params.agent_group_id,
+          session_count: sessions.length,
+          running_count: sessions.filter((s) => isContainerRunning(s.id)).length,
+        });
+        return;
+      }
+
+      case 'agent.restart_containers': {
+        const params = req.params as { agent_group_id?: string } | undefined;
+        if (!params?.agent_group_id) {
+          respond(ws, req.id, false, undefined, { code: 'bad-params', message: 'agent_group_id required' });
+          return;
+        }
+        // Operator-level: only owner/global-admin/admin-of-group. Plain
+        // members shouldn't be able to disrupt running work.
+        const access = canAccessAgentGroup(userId, params.agent_group_id);
+        if (!access.allowed || access.reason === 'member') {
+          respond(ws, req.id, false, undefined, {
+            code: 'forbidden',
+            message: 'Only admins of this agent group can restart its containers',
+          });
+          return;
+        }
+        const sessions = getSessionsByAgentGroup(params.agent_group_id).filter(
+          (s) => s.status === 'active' && isContainerRunning(s.id),
+        );
+        for (const s of sessions) {
+          killContainer(s.id, `web user ${userId} requested restart`);
+        }
+        log.info('Web channel: restarted containers', { count: sessions.length, agentGroupId: params.agent_group_id });
+        respond(ws, req.id, true, { restarted: sessions.length });
+        return;
+      }
 
       default:
         respond(ws, req.id, false, undefined, { code: 'unknown-method', message: `Unknown method: ${req.method}` });

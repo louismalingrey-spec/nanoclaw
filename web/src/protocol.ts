@@ -98,3 +98,52 @@ export interface AppChangedEvent {
   name: string;
   updated_at: string;
 }
+
+export interface ArtifactSummary {
+  id: string;
+  agent_group_id: string;
+  name: string;
+  kind: string;
+  updated_at: string;
+}
+
+export interface ArtifactFull extends ArtifactSummary {
+  content: string;
+  created_at: string;
+}
+
+export interface ArtifactChangedEvent {
+  artifact_id: string;
+  name: string;
+  updated_at: string;
+}
+
+export interface NotificationEntry {
+  id: string;
+  agent_group_id: string;
+  kind: string;
+  title: string;
+  body: string | null;
+  created_at: string;
+  read_at: string | null;
+}
+
+export interface NotificationNewEvent {
+  id: string;
+  kind: string;
+  title: string;
+  body?: string;
+  created_at: string;
+}
+
+export interface CronEntry {
+  id: string;
+  session_id: string;
+  status: string;
+  recurrence: string | null;
+  process_after: string | null;
+  series_id: string | null;
+  prompt: string;
+  script: string | null;
+  created_at: string;
+}

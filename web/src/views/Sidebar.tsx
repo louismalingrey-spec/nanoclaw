@@ -1,6 +1,7 @@
-import type { Agent, AppSummary, SessionPreview } from "../protocol";
+import type { Agent, AppSummary, ArtifactSummary, CronEntry, SessionPreview } from "../protocol";
 import type { ConnectionState } from "../engine";
 import { ConversationsSection } from "./ConversationsSection";
+import { SchedulesSection } from "./SchedulesSection";
 
 export function Sidebar({
   agents,
@@ -12,6 +13,13 @@ export function Sidebar({
   apps,
   activeApp,
   onOpenApp,
+  artifacts,
+  activeArtifact,
+  onOpenArtifact,
+  crons,
+  unreadCount,
+  onOpenNotifications,
+  onOpenSettings,
   state,
   userId,
   onLogout,
@@ -25,6 +33,13 @@ export function Sidebar({
   apps: AppSummary[];
   activeApp: string | null;
   onOpenApp: (id: string) => void;
+  artifacts: ArtifactSummary[];
+  activeArtifact: string | null;
+  onOpenArtifact: (id: string) => void;
+  crons: CronEntry[];
+  unreadCount: number;
+  onOpenNotifications: () => void;
+  onOpenSettings: () => void;
   state: ConnectionState;
   userId: string | null;
   onLogout: () => void;
@@ -42,7 +57,72 @@ export function Sidebar({
       }}
     >
       <header style={{ padding: "4px 8px 12px" }}>
-        <div style={{ fontWeight: 600, fontSize: 14 }}>NanoClaw OS</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <div style={{ fontWeight: 600, fontSize: 14, flex: 1 }}>NanoClaw OS</div>
+          <button
+            onClick={onOpenNotifications}
+            title={
+              unreadCount > 0
+                ? `${unreadCount} unread notification${unreadCount === 1 ? "" : "s"}`
+                : "Notifications"
+            }
+            style={{
+              position: "relative",
+              border: "1px solid var(--ncl-border)",
+              background: "var(--ncl-surface)",
+              color: "inherit",
+              borderRadius: 6,
+              width: 28,
+              height: 28,
+              cursor: "pointer",
+              padding: 0,
+              lineHeight: 1,
+              fontSize: 14,
+            }}
+          >
+            🔔
+            {unreadCount > 0 && (
+              <span
+                style={{
+                  position: "absolute",
+                  top: -4,
+                  right: -4,
+                  minWidth: 14,
+                  height: 14,
+                  padding: "0 3px",
+                  background: "#ef4444",
+                  color: "white",
+                  borderRadius: 7,
+                  fontSize: 9,
+                  fontWeight: 700,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                {unreadCount > 99 ? "99+" : unreadCount}
+              </span>
+            )}
+          </button>
+          <button
+            onClick={onOpenSettings}
+            title="Settings"
+            style={{
+              border: "1px solid var(--ncl-border)",
+              background: "var(--ncl-surface)",
+              color: "inherit",
+              borderRadius: 6,
+              width: 28,
+              height: 28,
+              cursor: "pointer",
+              padding: 0,
+              lineHeight: 1,
+              fontSize: 14,
+            }}
+          >
+            ⚙
+          </button>
+        </div>
         <div
           style={{
             display: "flex",
@@ -155,6 +235,52 @@ export function Sidebar({
               );
             })
           )}
+        </>
+      )}
+
+      {activeAgent && (
+        <>
+          <div
+            style={{
+              fontSize: 11,
+              textTransform: "uppercase",
+              letterSpacing: 0.5,
+              color: "var(--ncl-faint)",
+              padding: "16px 8px 4px",
+            }}
+          >
+            Artifacts
+          </div>
+          {artifacts.length === 0 ? (
+            <div style={{ padding: "4px 8px", fontSize: 12, color: "var(--ncl-faint)" }}>None yet.</div>
+          ) : (
+            artifacts.map((a) => {
+              const active = a.id === activeArtifact;
+              return (
+                <button
+                  key={a.id}
+                  onClick={() => onOpenArtifact(a.id)}
+                  style={{
+                    textAlign: "left",
+                    padding: "6px 10px",
+                    borderRadius: 6,
+                    border: "1px solid " + (active ? "var(--ncl-accent)" : "transparent"),
+                    background: active ? "var(--ncl-accent-bg)" : "transparent",
+                    cursor: "pointer",
+                    fontSize: 12,
+                    color: "inherit",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 1,
+                  }}
+                >
+                  <span style={{ fontWeight: 500 }}>{a.name}</span>
+                  <span style={{ fontSize: 10, color: "var(--ncl-faint)" }}>{relTime(a.updated_at)}</span>
+                </button>
+              );
+            })
+          )}
+          <SchedulesSection crons={crons} />
         </>
       )}
 

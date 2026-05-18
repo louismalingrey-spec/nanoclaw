@@ -14,10 +14,16 @@ import type {
   AppChangedEvent,
   AppFull,
   AppSummary,
+  ArtifactChangedEvent,
+  ArtifactFull,
+  ArtifactSummary,
   ChatFinalEvent,
   ClientFrame,
+  CronEntry,
   EventFrame,
   HistoryMessage,
+  NotificationEntry,
+  NotificationNewEvent,
   ServerFrame,
   SessionPreview,
 } from "./protocol";
@@ -33,6 +39,8 @@ export interface EngineEvents {
   "chat.final": ChatFinalEvent;
   "chat.typing": { agent_group_id: string; ts: string };
   "app.changed": AppChangedEvent;
+  "artifact.changed": ArtifactChangedEvent;
+  "notification.new": NotificationNewEvent;
   /** Sandbox DB rows changed for this agent group — refresh open Query()s. */
   "db.changed": { changes: number };
   /** Sandbox DB write failed on the host. Surfaced as a small warning. */
@@ -135,6 +143,46 @@ export class NanoClawEngine {
 
   async getApp(id: string): Promise<AppFull> {
     return (await this.request("apps.get", { id })) as AppFull;
+  }
+
+  async listArtifacts(agentGroupId: string): Promise<ArtifactSummary[]> {
+    const r = (await this.request("artifacts.list", { agent_group_id: agentGroupId })) as { artifacts: ArtifactSummary[] };
+    return r.artifacts;
+  }
+
+  async getArtifact(id: string): Promise<ArtifactFull> {
+    return (await this.request("artifacts.get", { id })) as ArtifactFull;
+  }
+
+  async listNotifications(agentGroupId: string): Promise<{ notifications: NotificationEntry[]; unread: number }> {
+    return (await this.request("notifications.list", { agent_group_id: agentGroupId })) as {
+      notifications: NotificationEntry[];
+      unread: number;
+    };
+  }
+
+  async markAllNotificationsRead(agentGroupId: string): Promise<void> {
+    await this.request("notifications.mark_read", { agent_group_id: agentGroupId, all: true });
+  }
+
+  async listCrons(agentGroupId: string): Promise<CronEntry[]> {
+    const r = (await this.request("crons.list", { agent_group_id: agentGroupId })) as { crons: CronEntry[] };
+    return r.crons;
+  }
+
+  async agentStatus(agentGroupId: string): Promise<{ agent_group_id: string; session_count: number; running_count: number }> {
+    return (await this.request("agent.status", { agent_group_id: agentGroupId })) as {
+      agent_group_id: string;
+      session_count: number;
+      running_count: number;
+    };
+  }
+
+  async restartContainers(agentGroupId: string): Promise<number> {
+    const r = (await this.request("agent.restart_containers", { agent_group_id: agentGroupId })) as {
+      restarted: number;
+    };
+    return r.restarted;
   }
 
   async dbQuery(
@@ -244,6 +292,10 @@ export class NanoClawEngine {
         this.emit("chat.typing", evt.payload as { agent_group_id: string; ts: string });
       } else if (evt.event === "app.changed") {
         this.emit("app.changed", evt.payload as AppChangedEvent);
+      } else if (evt.event === "artifact.changed") {
+        this.emit("artifact.changed", evt.payload as ArtifactChangedEvent);
+      } else if (evt.event === "notification.new") {
+        this.emit("notification.new", evt.payload as NotificationNewEvent);
       } else if (evt.event === "db.changed") {
         this.emit("db.changed", evt.payload as { changes: number });
       } else if (evt.event === "db.error") {
