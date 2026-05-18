@@ -1,0 +1,95 @@
+/* Workspace-level animations + CSS-variable theme tokens.
+ * Components read these so a single class swap on <html> shifts the
+ * whole UI between light and dark. Inline styles also fall through to
+ * var() so any visual override stays theme-aware.
+ */
+@keyframes nclw-caret {
+  0%, 50% { opacity: 1; }
+  50.01%, 100% { opacity: 0; }
+}
+
+@keyframes nclw-dot {
+  0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
+  40% { opacity: 1; transform: translateY(-2px); }
+}
+
+@keyframes nclw-fadein {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+html {
+  /* Light theme defaults. data-theme="dark" on <html> swaps. */
+  --ncl-bg: #ffffff;
+  --ncl-bg-soft: #fafafa;
+  --ncl-surface: #ffffff;
+  --ncl-fg: #111827;
+  --ncl-muted: #6b7280;
+  --ncl-faint: #9ca3af;
+  --ncl-border: #e5e7eb;
+  --ncl-border-soft: #f3f4f6;
+  --ncl-accent: #3b82f6;
+  --ncl-accent-bg: #eff6ff;
+  --ncl-accent-fg: #1e40af;
+  --ncl-user-bg: #111827;
+  --ncl-user-fg: #ffffff;
+  --ncl-assistant-bg: #f3f4f6;
+}
+
+html[data-theme="dark"] {
+  --ncl-bg: #0b0f1a;
+  --ncl-bg-soft: #111827;
+  --ncl-surface: #1f2937;
+  --ncl-fg: #f3f4f6;
+  --ncl-muted: #9ca3af;
+  --ncl-faint: #6b7280;
+  --ncl-border: #374151;
+  --ncl-border-soft: #1f2937;
+  --ncl-accent: #60a5fa;
+  --ncl-accent-bg: #1e3a8a33;
+  --ncl-accent-fg: #93c5fd;
+  --ncl-user-bg: #2563eb;
+  --ncl-user-fg: #ffffff;
+  --ncl-assistant-bg: #1f2937;
+
+  color-scheme: dark;
+}
+
+body {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  background: var(--ncl-bg);
+  color: var(--ncl-fg);
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--ncl-accent);
+  outline-offset: 1px;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--ncl-border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--ncl-faint); }
+
+/* Soft hover wash on sidebar buttons (active state has its own accent
+   colours, so we only paint for non-active rows). */
+aside button:not(:focus):hover {
+  background: var(--ncl-border-soft);
+}
+
+/* Smooth theme transitions on the bits that swap colour. */
+aside, header, button, textarea, input, [role="dialog"], main {
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+[role="dialog"] {
+  animation: nclw-fadein 160ms ease-out;
+}
