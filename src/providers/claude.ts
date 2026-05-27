@@ -24,17 +24,22 @@ import { readEnvFile } from '../env.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 
 registerProviderContainerConfig('claude', () => {
+  // Mirror src/config.ts pattern: process.env wins, .env file is the fallback.
+  // process.env is how docker compose passes vars via its `environment:` block
+  // (no .env file lands at /app/.env inside the container).
   const dotenv = readEnvFile(['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY']);
+  const baseUrl = process.env.ANTHROPIC_BASE_URL || dotenv.ANTHROPIC_BASE_URL;
+  const apiKey = process.env.ANTHROPIC_API_KEY || dotenv.ANTHROPIC_API_KEY;
   const env: Record<string, string> = {};
 
-  if (dotenv.ANTHROPIC_BASE_URL) {
-    env.ANTHROPIC_BASE_URL = dotenv.ANTHROPIC_BASE_URL;
+  if (baseUrl) {
+    env.ANTHROPIC_BASE_URL = baseUrl;
   }
 
-  if (dotenv.ANTHROPIC_API_KEY) {
+  if (apiKey) {
     // Direct env-var auth — no OneCLI proxy involved.
-    env.ANTHROPIC_API_KEY = dotenv.ANTHROPIC_API_KEY;
-  } else if (dotenv.ANTHROPIC_BASE_URL) {
+    env.ANTHROPIC_API_KEY = apiKey;
+  } else if (baseUrl) {
     // OneCLI proxy auth — placeholder gets overwritten on the wire.
     env.ANTHROPIC_AUTH_TOKEN = 'placeholder';
   }
