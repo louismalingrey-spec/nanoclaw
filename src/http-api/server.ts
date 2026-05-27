@@ -45,6 +45,12 @@ const HEALTH_PATH = '/api/health';
 export interface StartHttpApiOptions {
   port: number;
   token: string | undefined;
+  /**
+   * Address to bind on. Defaults to 127.0.0.1 (Mac install, cloudflared on
+   * host network). On the VPS docker install, set this to 0.0.0.0 so the
+   * sidecar cloudflared container can reach us via the internal bridge.
+   */
+  bind?: string;
 }
 
 export function startHttpApi(opts: StartHttpApiOptions): Server {
@@ -65,8 +71,9 @@ export function startHttpApi(opts: StartHttpApiOptions): Server {
     });
   });
 
-  server.listen(opts.port, '127.0.0.1', () => {
-    log.info('HTTP API listening', { url: `http://127.0.0.1:${opts.port}` });
+  const bind = opts.bind ?? '127.0.0.1';
+  server.listen(opts.port, bind, () => {
+    log.info('HTTP API listening', { url: `http://${bind}:${opts.port}` });
   });
 
   return server;

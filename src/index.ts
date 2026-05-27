@@ -194,10 +194,11 @@ async function main(): Promise<void> {
   // 7. HTTP API for agency-os dashboard.
   //    Default port 3003 (3002 is gbrain proxy). Override via NANOCLAW_HTTP_PORT.
   //    Token comes from .env via readEnvFile so it never enters process.env.
-  const apiEnv = readEnvFile(['NANOCLAW_API_TOKEN', 'NANOCLAW_HTTP_PORT']);
+  const apiEnv = readEnvFile(['NANOCLAW_API_TOKEN', 'NANOCLAW_HTTP_PORT', 'NANOCLAW_HTTP_BIND']);
   const apiPort = Number(process.env.NANOCLAW_HTTP_PORT ?? apiEnv.NANOCLAW_HTTP_PORT ?? 3003);
   const apiToken = process.env.NANOCLAW_API_TOKEN ?? apiEnv.NANOCLAW_API_TOKEN;
-  const httpApiServer = startHttpApi({ port: apiPort, token: apiToken });
+  const apiBind = process.env.NANOCLAW_HTTP_BIND ?? apiEnv.NANOCLAW_HTTP_BIND;
+  const httpApiServer = startHttpApi({ port: apiPort, token: apiToken, bind: apiBind });
   onShutdown(() => new Promise<void>((resolve) => httpApiServer.close(() => resolve())));
 
   // 8. API-trigger dispatcher — polls `runs WHERE status='queued'` and
