@@ -72,7 +72,9 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
-  // Build MCP servers config: nanoclaw built-in + any from container.json
+  const gbrainMcpPath = path.join(__dirname, 'gbrain-mcp-stdio.ts');
+
+  // Build MCP servers config: nanoclaw built-in + gbrain (if proxy is wired) + container.json
   const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
     nanoclaw: {
       command: 'bun',
@@ -80,6 +82,15 @@ async function main(): Promise<void> {
       env: {},
     },
   };
+
+  if (process.env.GBRAIN_PROXY_URL) {
+    mcpServers.gbrain = {
+      command: 'bun',
+      args: ['run', gbrainMcpPath],
+      env: { GBRAIN_PROXY_URL: process.env.GBRAIN_PROXY_URL },
+    };
+    log(`GBrain MCP server registered (proxy: ${process.env.GBRAIN_PROXY_URL})`);
+  }
 
   for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
     mcpServers[name] = serverConfig;

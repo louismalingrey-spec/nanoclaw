@@ -150,9 +150,7 @@ export function countUnreadNotifications(agentGroupId: string): number {
 }
 
 export function markNotificationRead(id: string, readAt: string): void {
-  getDb()
-    .prepare('UPDATE web_notifications SET read_at = ? WHERE id = ? AND read_at IS NULL')
-    .run(readAt, id);
+  getDb().prepare('UPDATE web_notifications SET read_at = ? WHERE id = ? AND read_at IS NULL').run(readAt, id);
 }
 
 export function markAllNotificationsRead(agentGroupId: string, readAt: string): void {

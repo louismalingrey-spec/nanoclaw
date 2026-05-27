@@ -23,6 +23,10 @@
         <string>{{HOME}}</string>
         <key>ASSISTANT_NAME</key>
         <string>Andy</string>
+        <key>NANOCLAW_API_TOKEN</key>
+        <string>{{NANOCLAW_API_TOKEN}}</string>
+        <key>NANOCLAW_HTTP_PORT</key>
+        <string>3003</string>
     </dict>
     <key>StandardOutPath</key>
     <string>{{PROJECT_ROOT}}/logs/nanoclaw.log</string>

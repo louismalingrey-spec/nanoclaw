@@ -88,7 +88,10 @@ export function closeAllSandboxes(): void {
  * arbitrary writes against the sandbox DB. Keep it conservative.
  */
 export function isReadOnlySql(sql: string): boolean {
-  const stripped = sql.replace(/^\s*(?:(?:--[^\n]*\n)\s*|(?:\/\*[\s\S]*?\*\/)\s*)*/u, '').trimStart().toLowerCase();
+  const stripped = sql
+    .replace(/^\s*(?:(?:--[^\n]*\n)\s*|(?:\/\*[\s\S]*?\*\/)\s*)*/u, '')
+    .trimStart()
+    .toLowerCase();
   return (
     stripped.startsWith('select') ||
     stripped.startsWith('with') ||

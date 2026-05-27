@@ -86,11 +86,15 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #
 # only-built-dependencies gates pnpm's supply-chain policy:
 #   - agent-browser has a postinstall build step.
-#   - @anthropic-ai/claude-code's postinstall downloads the native Claude
-#     binary (linux-arm64 variant on our image). Without the allowlist
-#     the SDK fails at spawn time with "native binary not found".
+#   - @anthropic-ai/claude-code's postinstall copies the native Claude binary
+#     from the platform-specific optional dep. Without the allowlist the
+#     postinstall is skipped and the SDK fails with "native binary not found".
+#
+# pnpm 11 does not install optional deps for global installs, so the
+# platform-specific package (@anthropic-ai/claude-code-{platform}) must be
+# installed alongside claude-code in the same pnpm install -g call.
 ENV PNPM_HOME="/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
+ENV PATH="$PNPM_HOME/bin:$PNPM_HOME:$PATH"
 RUN corepack enable
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
@@ -102,7 +106,14 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "agent-browser@${AGENT_BROWSER_VERSION}"
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
-    pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+    ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then PLATFORM="linux-arm64"; else PLATFORM="linux-x64"; fi && \
+    pnpm install -g \
+        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+        "@anthropic-ai/claude-code-${PLATFORM}@${CLAUDE_CODE_VERSION}" && \
+    for dir in /pnpm/global/v11/*/node_modules/@anthropic-ai/claude-code; do \
+        [ -d "${dir%/claude-code}/claude-code-${PLATFORM}" ] && node "$dir/install.cjs" && break; \
+    done
 
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh

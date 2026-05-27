@@ -45,8 +45,24 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
     fs.mkdirSync(groupDir, { recursive: true });
   }
 
+  // Write the shared base CLAUDE.md as a regular file (not a symlink).
+  // Apple Container doesn't support individual file bind mounts, so the
+  // container/CLAUDE.md content is materialized here at compose time instead
+  // of being mounted to /app/CLAUDE.md and symlinked.
   const sharedLink = path.join(groupDir, '.claude-shared.md');
-  syncSymlink(sharedLink, SHARED_CLAUDE_MD_CONTAINER_PATH);
+  const sharedClaudeMdSrc = path.join(process.cwd(), 'container', 'CLAUDE.md');
+  if (fs.existsSync(sharedClaudeMdSrc)) {
+    const content = fs.readFileSync(sharedClaudeMdSrc, 'utf-8');
+    // Remove stale symlink if present before writing as a file
+    try {
+      if (fs.lstatSync(sharedLink).isSymbolicLink()) fs.unlinkSync(sharedLink);
+    } catch {
+      /* missing */
+    }
+    writeAtomic(sharedLink, content);
+  } else {
+    syncSymlink(sharedLink, SHARED_CLAUDE_MD_CONTAINER_PATH);
+  }
 
   const fragmentsDir = path.join(groupDir, '.claude-fragments');
   if (!fs.existsSync(fragmentsDir)) {

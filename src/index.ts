@@ -4,6 +4,7 @@
  * Thin orchestrator: init DB, run migrations, start channel adapters,
  * start delivery polls, start sweep, handle shutdown.
  */
+import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
@@ -13,9 +14,20 @@ import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
+import { startDispatcher, stopDispatcher } from './dispatcher/api-trigger-dispatcher.js';
+import { startGbrainProxy } from './gbrain-proxy.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { startHttpApi } from './http-api/server.js';
 import { routeInbound } from './router.js';
+import { readEnvFile } from './env.js';
 import { log } from './log.js';
+
+const GBRAIN_PROXY_PORT = 3002;
+const GBRAIN_BIN_CANDIDATES = [
+  '/Users/louismalingrey/.bun/bin/gbrain',
+  `${process.env.HOME}/.bun/bin/gbrain`,
+  '/usr/local/bin/gbrain',
+];
 
 // Response + shutdown registries live in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -74,6 +86,22 @@ async function main(): Promise<void> {
   // 2. Container runtime
   ensureContainerRuntimeRunning();
   cleanupOrphans();
+
+  // 2b. GBrain proxy — optional, starts only if gbrain binary is present.
+  const gbrainBin = GBRAIN_BIN_CANDIDATES.find((p) => fs.existsSync(p));
+  if (gbrainBin) {
+    try {
+      const gbrainServer = await startGbrainProxy(GBRAIN_PROXY_PORT, gbrainBin);
+      onShutdown(() => new Promise<void>((resolve) => gbrainServer.close(() => resolve())));
+    } catch (err) {
+      log.warn('GBrain proxy failed to start — brain tools will be unavailable', {
+        gbrainBin,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  } else {
+    log.debug('GBrain binary not found — skipping proxy');
+  }
 
   // 3. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
@@ -162,6 +190,25 @@ async function main(): Promise<void> {
   // 6. Start host sweep
   startHostSweep();
   log.info('Host sweep started');
+
+  // 7. HTTP API for agency-os dashboard.
+  //    Default port 3003 (3002 is gbrain proxy). Override via NANOCLAW_HTTP_PORT.
+  //    Token comes from .env via readEnvFile so it never enters process.env.
+  const apiEnv = readEnvFile(['NANOCLAW_API_TOKEN', 'NANOCLAW_HTTP_PORT']);
+  const apiPort = Number(process.env.NANOCLAW_HTTP_PORT ?? apiEnv.NANOCLAW_HTTP_PORT ?? 3003);
+  const apiToken = process.env.NANOCLAW_API_TOKEN ?? apiEnv.NANOCLAW_API_TOKEN;
+  const httpApiServer = startHttpApi({ port: apiPort, token: apiToken });
+  onShutdown(
+    () => new Promise<void>((resolve) => httpApiServer.close(() => resolve())),
+  );
+
+  // 8. API-trigger dispatcher — polls `runs WHERE status='queued'` and
+  //    wakes containers via the synthetic api-trigger messaging group.
+  //    Must start AFTER the channel adapters + delivery polls + http api so
+  //    a dispatched run can be observed end-to-end (trigger → wake → events
+  //    → outbound delivery).
+  startDispatcher();
+  onShutdown(() => stopDispatcher());
 
   log.info('NanoClaw running');
 }
