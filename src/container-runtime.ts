@@ -11,6 +11,15 @@ import { log } from './log.js';
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
 
+/**
+ * Hostname spawned containers use to reach the host machine. On Linux
+ * this hostname is provided by `--add-host=host.docker.internal:host-gateway`
+ * (see hostGatewayArgs). On macOS the Docker runtime resolves it natively.
+ * The Apple Container (Mac legacy) path overrides via
+ * patchArgsForAppleContainer() in container-runner.ts.
+ */
+export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
+
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
   // On Linux, host.docker.internal isn't built-in — add it explicitly
