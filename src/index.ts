@@ -198,9 +198,7 @@ async function main(): Promise<void> {
   const apiPort = Number(process.env.NANOCLAW_HTTP_PORT ?? apiEnv.NANOCLAW_HTTP_PORT ?? 3003);
   const apiToken = process.env.NANOCLAW_API_TOKEN ?? apiEnv.NANOCLAW_API_TOKEN;
   const httpApiServer = startHttpApi({ port: apiPort, token: apiToken });
-  onShutdown(
-    () => new Promise<void>((resolve) => httpApiServer.close(() => resolve())),
-  );
+  onShutdown(() => new Promise<void>((resolve) => httpApiServer.close(() => resolve())));
 
   // 8. API-trigger dispatcher — polls `runs WHERE status='queued'` and
   //    wakes containers via the synthetic api-trigger messaging group.
