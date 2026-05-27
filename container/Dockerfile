@@ -115,6 +115,13 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
         [ -d "${dir%/claude-code}/claude-code-${PLATFORM}" ] && node "$dir/install.cjs" && break; \
     done
 
+# ---- LLM provider defaults ---------------------------------------------------
+# Route all Claude Code SDK calls through OpenRouter by default. The actual
+# auth key (ANTHROPIC_API_KEY) is injected per spawn by the daemon's host-side
+# provider config (src/providers/claude.ts) — never baked into the image.
+# Can be overridden at spawn time by re-exporting -e ANTHROPIC_BASE_URL=...
+ENV ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1
+
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

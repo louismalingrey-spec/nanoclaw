@@ -506,18 +506,47 @@ async function buildContainerArgs(
   }
 
   // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
-  // are routed through the agent vault for credential injection. Treated as
-  // a transient hard failure: if we can't wire the gateway, we don't spawn.
-  // The caller (router or host-sweep) catches the throw, leaves the inbound
-  // message pending, and the next sweep tick retries.
-  if (agentIdentifier) {
-    await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+  // are routed through the agent vault for credential injection.
+  //
+  // Two paths:
+  //   - OneCLI configured (ONECLI_URL set, daemon reachable): apply gateway.
+  //     If it fails, treat as transient hard failure and refuse to spawn.
+  //   - OneCLI not configured AND provider forwards a real API key
+  //     (ANTHROPIC_API_KEY etc. via providerContribution.env): bypass the
+  //     gateway. The container authenticates with the env-var key directly.
+  //     This is the VPS / single-tenant deployment mode where OneCLI is
+  //     not migrated.
+  const oneCliConfigured = Boolean(ONECLI_URL && ONECLI_API_KEY);
+  const directKeyForwarded = Boolean(
+    providerContribution.env?.ANTHROPIC_API_KEY ||
+      providerContribution.env?.OPENAI_API_KEY ||
+      providerContribution.env?.GOOGLE_API_KEY,
+  );
+
+  if (oneCliConfigured) {
+    if (agentIdentifier) {
+      await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+    }
+    const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
+    if (!onecliApplied) {
+      if (directKeyForwarded) {
+        log.warn('OneCLI configured but applyContainerConfig failed — falling back to direct env-var auth', {
+          containerName,
+        });
+      } else {
+        throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
+      }
+    } else {
+      log.info('OneCLI gateway applied', { containerName });
+    }
+  } else if (directKeyForwarded) {
+    log.info('OneCLI not configured — using direct env-var auth (single-tenant mode)', { containerName });
+  } else {
+    throw new Error(
+      'No credentials available: OneCLI is not configured (ONECLI_URL / ONECLI_API_KEY) ' +
+        'and no provider forwarded an API key via .env. Set ANTHROPIC_API_KEY in .env or configure OneCLI.',
+    );
   }
-  const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
-  if (!onecliApplied) {
-    throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
-  }
-  log.info('OneCLI gateway applied', { containerName });
 
   // Apple Container compatibility: fix OneCLI-injected args.
   // 1. Replace host.docker.internal with the actual bridge gateway IP — Apple Container
