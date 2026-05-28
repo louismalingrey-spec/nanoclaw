@@ -27,10 +27,21 @@ registerProviderContainerConfig('claude', () => {
   // Mirror src/config.ts pattern: process.env wins, .env file is the fallback.
   // process.env is how docker compose passes vars via its `environment:` block
   // (no .env file lands at /app/.env inside the container).
-  const dotenv = readEnvFile(['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL']);
+  // Forwarded model-related env. The DEFAULT_*_MODEL overrides let the
+  // Claude Code CLI pass its own allowlist check (using a native alias
+  // like "sonnet") while sending the OpenRouter-prefixed slug on the
+  // wire. See deploy/hetzner-stack/nanoclaw/docker-compose.yml for the
+  // rationale.
+  const MODEL_VARS = [
+    'ANTHROPIC_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  ] as const;
+
+  const dotenv = readEnvFile(['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', ...MODEL_VARS]);
   const baseUrl = process.env.ANTHROPIC_BASE_URL || dotenv.ANTHROPIC_BASE_URL;
   const apiKey = process.env.ANTHROPIC_API_KEY || dotenv.ANTHROPIC_API_KEY;
-  const model = process.env.ANTHROPIC_MODEL || dotenv.ANTHROPIC_MODEL;
   const env: Record<string, string> = {};
 
   if (baseUrl) {
@@ -45,11 +56,11 @@ registerProviderContainerConfig('claude', () => {
     env.ANTHROPIC_AUTH_TOKEN = 'placeholder';
   }
 
-  // Forward ANTHROPIC_MODEL so container/agent-runner can resolve it (and
-  // auto-prefix "anthropic/" for OpenRouter — see container/agent-runner/
-  // src/providers/claude.ts:resolveModel).
-  if (model) {
-    env.ANTHROPIC_MODEL = model;
+  for (const key of MODEL_VARS) {
+    const value = process.env[key] || dotenv[key];
+    if (value) {
+      env[key] = value;
+    }
   }
 
   return { env };
