@@ -250,20 +250,16 @@ const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WIN
  */
 const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found/i;
 
-// Claude Code CLI's native short aliases — pass these through untouched
-// so the CLI's own resolution (and any ANTHROPIC_DEFAULT_*_MODEL wire-id
-// override) takes effect. Prefixing these would break the CLI's
-// allowlist check.
-const CLI_NATIVE_ALIASES = new Set(['sonnet', 'opus', 'haiku', 'inherit']);
-
 /**
- * Resolve the model passed to the Anthropic SDK.
+ * Resolve the model passed to the Anthropic SDK — pure pass-through.
  *
- * When ANTHROPIC_BASE_URL points at OpenRouter, the backend expects
- * provider-prefixed slugs (`anthropic/claude-sonnet-4.6`, not
- * `claude-sonnet-4.6`). We auto-prefix bare Claude ids but never touch
- * native CLI aliases (sonnet/opus/haiku) — those are resolved to a wire
- * id by the CLI itself, optionally via ANTHROPIC_DEFAULT_*_MODEL.
+ * We used to auto-prefix `anthropic/` for OpenRouter, but that path
+ * fights Claude Code CLI's hardcoded allowlist (which rejects prefixed
+ * slugs). The working setup is: native Anthropic dashed ids
+ * (`claude-sonnet-4-5`, `claude-haiku-4-5`, …) — those pass the CLI's
+ * allowlist AND OpenRouter routes them via its Anthropic-compat
+ * endpoint without needing a provider prefix. So we just forward
+ * ANTHROPIC_MODEL verbatim.
  *
  * Order of precedence:
  *   1. provider-options env (per-container override)
@@ -271,16 +267,7 @@ const CLI_NATIVE_ALIASES = new Set(['sonnet', 'opus', 'haiku', 'inherit']);
  *   3. undefined → SDK falls back to its own default
  */
 function resolveModel(providerEnv: Record<string, string | undefined>): string | undefined {
-  const requested = providerEnv.ANTHROPIC_MODEL ?? process.env.ANTHROPIC_MODEL;
-  if (!requested) return undefined;
-  if (CLI_NATIVE_ALIASES.has(requested) || requested.includes('/')) {
-    return requested;
-  }
-  const baseUrl = providerEnv.ANTHROPIC_BASE_URL ?? process.env.ANTHROPIC_BASE_URL ?? '';
-  if (baseUrl.includes('openrouter.ai')) {
-    return `anthropic/${requested}`;
-  }
-  return requested;
+  return providerEnv.ANTHROPIC_MODEL ?? process.env.ANTHROPIC_MODEL;
 }
 
 export class ClaudeProvider implements AgentProvider {
