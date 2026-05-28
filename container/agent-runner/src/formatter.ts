@@ -210,6 +210,20 @@ function formatWebhookMessage(msg: MessageInRow): string {
 
 function formatSystemMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
+
+  // Host dispatcher → agent: a queued HTTP API run was claimed and dispatched
+  // here. The agent should see the run_id (so it can correlate logs / write a
+  // structured response) plus the actual input payload.
+  if (content?.type === 'api_trigger') {
+    const lines = ['[API TRIGGER]'];
+    if (content.run_id) lines.push(`run_id: ${content.run_id}`);
+    if (content.dedup_key) lines.push(`dedup_key: ${content.dedup_key}`);
+    if (content.priority) lines.push(`priority: ${content.priority}`);
+    if (content.target_entity_id) lines.push(`target_entity_id: ${content.target_entity_id}`);
+    lines.push('', 'Input:', JSON.stringify(content.input ?? {}, null, 2));
+    return lines.join('\n');
+  }
+
   return `[SYSTEM RESPONSE]\n\nAction: ${content.action || 'unknown'}\nStatus: ${content.status || 'unknown'}\nResult: ${JSON.stringify(content.result || null)}`;
 }
 

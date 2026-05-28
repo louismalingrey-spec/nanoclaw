@@ -21,6 +21,31 @@ function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/**
+ * True when a system message is MCP-tool plumbing (e.g. the host's reply to an
+ * AskUserQuestion or an action ack) and should NOT be surfaced as agent input.
+ *
+ * Synthetic injections from the host dispatcher (api_trigger, etc.) also use
+ * kind='system' but carry a different `content.type` — they MUST reach the
+ * agent. Filtering on type rather than kind keeps the two flows separate.
+ *
+ * Pre-2026-05-28 the filter was `kind !== 'system'`, which silently dropped
+ * every api_trigger payload — the dispatcher would happily spawn a container,
+ * the run sat in messages_in forever, reconcile() then marked the run
+ * 'success' on container exit even though the agent never executed anything.
+ */
+function isMcpResponse(m: MessageInRow): boolean {
+  if (m.kind !== 'system') return false;
+  try {
+    const parsed = JSON.parse(m.content) as { type?: unknown };
+    return parsed?.type === 'question_response';
+  } catch {
+    // Unparseable system content shouldn't happen, but if it does, don't
+    // drop it silently — let it surface so the issue is visible.
+    return false;
+  }
+}
+
 export interface PollLoopConfig {
   provider: AgentProvider;
   /**
@@ -63,8 +88,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
   let pollCount = 0;
   while (true) {
-    // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
-    const messages = getPendingMessages().filter((m) => m.kind !== 'system');
+    // Skip MCP tool responses (question_response shape). Other system messages
+    // — notably api_trigger payloads from the host dispatcher — DO reach the
+    // agent. See isMcpResponse() docstring.
+    const messages = getPendingMessages().filter((m) => !isMcpResponse(m));
     pollCount++;
 
     // Periodic heartbeat so we know the loop is alive
@@ -288,14 +315,16 @@ async function processQuery(
           return;
         }
 
-        // Skip system messages (MCP tool responses).
+        // Skip MCP tool responses (question_response shape) on follow-ups too.
+        // Other system messages (api_trigger payloads, etc.) still reach the
+        // agent — see isMcpResponse() above.
         // Thread routing is the router's concern — if a message landed in this
         // session, the agent should see it. Per-thread sessions already isolate
         // threads into separate containers; shared sessions intentionally merge
         // everything. Filtering on thread_id here caused deadlocks when the
         // initial batch and follow-ups had mismatched thread_ids (e.g. a
         // host-generated welcome trigger with null thread vs a Discord DM reply).
-        const newMessages = pending.filter((m) => m.kind !== 'system');
+        const newMessages = pending.filter((m) => !isMcpResponse(m));
         if (newMessages.length === 0) return;
 
         const newIds = newMessages.map((m) => m.id);
