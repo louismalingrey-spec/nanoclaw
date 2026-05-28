@@ -250,6 +250,28 @@ const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WIN
  */
 const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found/i;
 
+/**
+ * Resolve the model passed to the Anthropic SDK, accounting for OpenRouter's
+ * requirement that model IDs be prefixed with the provider slug
+ * (`anthropic/claude-sonnet-4-6`, not `claude-sonnet-4-6`). Without the
+ * prefix OpenRouter rejects the request with "There's an issue with the
+ * selected model".
+ *
+ * Order of precedence:
+ *   1. provider-options env (per-container override)
+ *   2. process.env (compose env: block)
+ *   3. undefined → SDK falls back to its own default
+ */
+function resolveModel(providerEnv: Record<string, string | undefined>): string | undefined {
+  const requested = providerEnv.ANTHROPIC_MODEL ?? process.env.ANTHROPIC_MODEL;
+  if (!requested) return undefined;
+  const baseUrl = providerEnv.ANTHROPIC_BASE_URL ?? process.env.ANTHROPIC_BASE_URL ?? '';
+  if (baseUrl.includes('openrouter.ai') && !requested.includes('/')) {
+    return `anthropic/${requested}`;
+  }
+  return requested;
+}
+
 export class ClaudeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = true;
 
@@ -279,6 +301,12 @@ export class ClaudeProvider implements AgentProvider {
 
     const instructions = input.systemContext?.instructions;
 
+    const model = resolveModel(this.env);
+    // Mirror the resolved model into env so the spawned Claude CLI process
+    // sees the same value the SDK is invoked with (Claude Code reads
+    // ANTHROPIC_MODEL natively when no --model flag is passed).
+    const envWithModel = model ? { ...this.env, ANTHROPIC_MODEL: model } : this.env;
+
     const sdkResult = sdkQuery({
       prompt: stream,
       options: {
@@ -286,13 +314,14 @@ export class ClaudeProvider implements AgentProvider {
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
         pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_PATH || '/pnpm/claude',
+        ...(model ? { model } : {}),
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: [
           ...TOOL_ALLOWLIST,
           ...Object.keys(this.mcpServers).map(mcpAllowPattern),
         ],
         disallowedTools: SDK_DISALLOWED_TOOLS,
-        env: this.env,
+        env: envWithModel,
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         settingSources: ['project', 'user'],
