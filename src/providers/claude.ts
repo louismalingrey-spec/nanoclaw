@@ -27,16 +27,20 @@ registerProviderContainerConfig('claude', () => {
   // Mirror src/config.ts pattern: process.env wins, .env file is the fallback.
   // process.env is how docker compose passes vars via its `environment:` block
   // (no .env file lands at /app/.env inside the container).
-  // Forwarded model-related env. The DEFAULT_*_MODEL overrides let the
-  // Claude Code CLI pass its own allowlist check (using a native alias
-  // like "sonnet") while sending the OpenRouter-prefixed slug on the
-  // wire. See deploy/hetzner-stack/nanoclaw/docker-compose.yml for the
-  // rationale.
+  // Forwarded model-related env. The DEFAULT_*_MODEL and CUSTOM_MODEL_OPTION
+  // overrides let the Claude Code CLI accept OpenRouter-prefixed slugs
+  // (e.g. "anthropic/claude-sonnet-4.6") that would otherwise be rejected
+  // by the CLI's hardcoded allowlist. See
+  // deploy/hetzner-stack/nanoclaw/docker-compose.yml for the rationale.
   const MODEL_VARS = [
     'ANTHROPIC_MODEL',
     'ANTHROPIC_DEFAULT_SONNET_MODEL',
     'ANTHROPIC_DEFAULT_OPUS_MODEL',
     'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    'ANTHROPIC_CUSTOM_MODEL_OPTION',
+    'ANTHROPIC_CUSTOM_MODEL_OPTION_NAME',
+    'ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION',
+    'ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES',
   ] as const;
 
   const dotenv = readEnvFile(['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', ...MODEL_VARS]);
