@@ -27,9 +27,10 @@ registerProviderContainerConfig('claude', () => {
   // Mirror src/config.ts pattern: process.env wins, .env file is the fallback.
   // process.env is how docker compose passes vars via its `environment:` block
   // (no .env file lands at /app/.env inside the container).
-  const dotenv = readEnvFile(['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY']);
+  const dotenv = readEnvFile(['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL']);
   const baseUrl = process.env.ANTHROPIC_BASE_URL || dotenv.ANTHROPIC_BASE_URL;
   const apiKey = process.env.ANTHROPIC_API_KEY || dotenv.ANTHROPIC_API_KEY;
+  const model = process.env.ANTHROPIC_MODEL || dotenv.ANTHROPIC_MODEL;
   const env: Record<string, string> = {};
 
   if (baseUrl) {
@@ -42,6 +43,13 @@ registerProviderContainerConfig('claude', () => {
   } else if (baseUrl) {
     // OneCLI proxy auth — placeholder gets overwritten on the wire.
     env.ANTHROPIC_AUTH_TOKEN = 'placeholder';
+  }
+
+  // Forward ANTHROPIC_MODEL so container/agent-runner can resolve it (and
+  // auto-prefix "anthropic/" for OpenRouter — see container/agent-runner/
+  // src/providers/claude.ts:resolveModel).
+  if (model) {
+    env.ANTHROPIC_MODEL = model;
   }
 
   return { env };
