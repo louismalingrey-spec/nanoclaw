@@ -522,10 +522,17 @@ function harvestOutcomeText(agentGroupId: string, sessionId: string, sinceIso: s
   let outDb: import('better-sqlite3').Database | null = null;
   try {
     outDb = openOutboundDb(agentGroupId, sessionId);
+    // messages_out.timestamp is stored in SQLite default format
+    // ("YYYY-MM-DD HH:MM:SS", space separator) while `sinceIso` is the
+    // dispatcher's ISO string with a "T" separator. Plain string compare
+    // would sort " " (0x20) below "T" (0x54), making the predicate
+    // always false and dropping every harvested row. Normalize both
+    // sides via SQLite's datetime() so the comparison is on parsed
+    // datetimes.
     const rows = outDb
       .prepare(
         `SELECT timestamp, content FROM messages_out
-          WHERE timestamp >= ?
+          WHERE datetime(timestamp) >= datetime(?)
           ORDER BY timestamp ASC, seq ASC`,
       )
       .all(sinceIso) as Array<{ timestamp: string; content: string }>;
@@ -580,11 +587,17 @@ interface OutcomeWebhookPayload {
 
 async function maybePostOutcomeWebhook(payload: OutcomeWebhookPayload): Promise<void> {
   const env = readEnvFile(['AGENCY_OS_OUTCOME_WEBHOOK', 'AGENCY_OS_OUTCOME_SECRET']);
-  const webhookUrl = process.env.AGENCY_OS_OUTCOME_WEBHOOK ?? env.AGENCY_OS_OUTCOME_WEBHOOK;
-  if (!webhookUrl) {
+  const webhookTemplate = process.env.AGENCY_OS_OUTCOME_WEBHOOK ?? env.AGENCY_OS_OUTCOME_WEBHOOK;
+  if (!webhookTemplate) {
     log.debug('AGENCY_OS_OUTCOME_WEBHOOK not set — skipping outcome push', { runId: payload.runId });
     return;
   }
+  // The configured URL carries a `__RUN_ID__` placeholder because agency-os
+  // routes outcomes per-run at /api/nanoclaw/runs/[runId]/outcome and
+  // validates body.run_id === URL runId. Without substitution the route
+  // fails its UUID Zod check and returns 400, silently dropping the
+  // outcome on the floor.
+  const webhookUrl = webhookTemplate.replace(/__RUN_ID__/g, encodeURIComponent(payload.runId));
   const secret = process.env.AGENCY_OS_OUTCOME_SECRET ?? env.AGENCY_OS_OUTCOME_SECRET;
 
   const body = JSON.stringify({
