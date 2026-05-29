@@ -3,8 +3,10 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
+import { getContinuation, setContinuation } from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import { runPollLoop } from './poll-loop.js';
+import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput } from './providers/types.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -74,6 +76,86 @@ describe('poll loop integration', () => {
     await loopPromise.catch(() => {});
   });
 
+  it('LANE #54: skill (api_trigger) batch clears prior continuation before query', async () => {
+    // Seed a stale continuation as if a prior chat or skill run left one behind.
+    // The fix in poll-loop.ts should detect the api_trigger system message in
+    // this batch and clear that continuation BEFORE calling provider.query,
+    // forcing the SDK to spawn a fresh transcript instead of resuming a
+    // potentially-corrupted one.
+    setContinuation('recording', 'stale-session-abc123');
+    expect(getContinuation('recording')).toBe('stale-session-abc123');
+
+    // Insert an api_trigger system message — the shape the dispatcher writes
+    // (see src/dispatcher/api-trigger-dispatcher.ts → writeSessionMessage).
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, content, trigger)
+         VALUES ('api-trigger-1', 'system', datetime('now'), 'pending', ?, 1)`,
+      )
+      .run(
+        JSON.stringify({
+          type: 'api_trigger',
+          run_id: 'run-test-1',
+          dedup_key: 'lane54-test',
+          priority: 'normal',
+          target_entity_id: null,
+          input: { _manual: true },
+          skill_slug: 'test-skill',
+          skill_version: 1,
+          skill_content: '# Test skill\n\nDo nothing.',
+        }),
+      );
+
+    const provider = new RecordingProvider();
+    const controller = new AbortController();
+    const loopPromise = Promise.race([
+      runPollLoop({ provider, providerName: 'recording', cwd: '/tmp' }),
+      new Promise<void>((_, reject) => {
+        controller.signal.addEventListener('abort', () => reject(new Error('aborted')));
+      }),
+      new Promise<void>((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000)),
+    ]);
+
+    await waitFor(() => provider.calls.length > 0, 2000);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    // The provider must have been called with continuation === undefined for
+    // this api_trigger batch — i.e. the stale 'stale-session-abc123' was NOT
+    // forwarded into the SDK call.
+    expect(provider.calls).toHaveLength(1);
+    expect(provider.calls[0].continuation).toBeUndefined();
+
+    // And the persisted slot was rewritten to the provider's new init id, not
+    // left as the stale one. (The mock provider emits 'fresh-init-id' on init.)
+    expect(getContinuation('recording')).toBe('fresh-init-id');
+  });
+
+  it('LANE #54: chat batch preserves prior continuation (no fresh-session reset)', async () => {
+    // The skill-fresh logic must NOT touch normal chat flows. Resuming a
+    // chat session is the whole point of session continuity.
+    setContinuation('recording', 'chat-session-keep-me');
+
+    insertMessage('m1', { sender: 'Alice', text: 'hello again' }, { platformId: 'chan-1', channelType: 'discord' });
+
+    const provider = new RecordingProvider();
+    const controller = new AbortController();
+    const loopPromise = Promise.race([
+      runPollLoop({ provider, providerName: 'recording', cwd: '/tmp' }),
+      new Promise<void>((_, reject) => {
+        controller.signal.addEventListener('abort', () => reject(new Error('aborted')));
+      }),
+      new Promise<void>((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000)),
+    ]);
+
+    await waitFor(() => provider.calls.length > 0, 2000);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    expect(provider.calls).toHaveLength(1);
+    expect(provider.calls[0].continuation).toBe('chat-session-keep-me');
+  });
+
   it('should process messages arriving after loop starts', async () => {
     const provider = new MockProvider({}, () => '<message to="discord-test">Processed</message>');
     const controller = new AbortController();
@@ -118,4 +200,51 @@ async function waitFor(condition: () => boolean, timeoutMs: number): Promise<voi
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Test-only provider that records the `QueryInput` of every query() call so the
+ * LANE #54 tests can assert what continuation poll-loop forwarded into the SDK.
+ */
+class RecordingProvider implements AgentProvider {
+  readonly supportsNativeSlashCommands = false;
+  readonly calls: QueryInput[] = [];
+
+  isSessionInvalid(_err: unknown): boolean {
+    return false;
+  }
+
+  query(input: QueryInput): AgentQuery {
+    this.calls.push({ ...input });
+    let ended = false;
+    let waiting: (() => void) | null = null;
+
+    const events: AsyncIterable<ProviderEvent> = {
+      async *[Symbol.asyncIterator]() {
+        yield { type: 'init', continuation: 'fresh-init-id' };
+        yield { type: 'result', text: '<message to="discord-test">ok</message>' };
+        while (!ended) {
+          await new Promise<void>((resolve) => {
+            waiting = resolve;
+          });
+          waiting = null;
+        }
+      },
+    };
+
+    return {
+      push() {
+        /* no-op for the recording test */
+      },
+      end() {
+        ended = true;
+        waiting?.();
+      },
+      events,
+      abort() {
+        ended = true;
+        waiting?.();
+      },
+    };
+  }
 }
