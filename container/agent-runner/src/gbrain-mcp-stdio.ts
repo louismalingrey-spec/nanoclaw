@@ -14,10 +14,25 @@
  * returns `{result}` or `{error}`.
  *
  * Tool catalog mirrors the proxy's ALLOWED_TOOLS set — keep in sync.
+ *
+ * --- Why raw JSON-RPC instead of @modelcontextprotocol/sdk ---
+ *
+ * The SDK's `Server` class validates incoming `initialize` requests with
+ * a Zod schema that requires `params.clientInfo` to be an object. Claude
+ * Agent SDK (as of @anthropic-ai/claude-agent-sdk@0.2.x) sends an
+ * `initialize` without `clientInfo`, which the server SDK rejects with
+ * JSON-RPC error -32603 "expected object, received undefined at
+ * params.clientInfo". The initialize handshake never completes →
+ * Claude SDK doesn't register `mcp__gbrain__*` in its tool catalog →
+ * the agent has no brain access (LANE #53 outcome was empty for this
+ * exact reason).
+ *
+ * Fix: implement the stdio transport + JSON-RPC dispatch ourselves with
+ * a permissive `initialize` handler. No version coupling to the SDK, no
+ * Zod schemas in the hot path. Logs go to stderr only — stdout is
+ * reserved for protocol frames.
  */
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListToolsRequestSchema, type Tool } from '@modelcontextprotocol/sdk/types.js';
+import { Buffer } from 'node:buffer';
 
 function log(msg: string): void {
   console.error(`[gbrain-mcp] ${msg}`);
@@ -29,7 +44,15 @@ if (!PROXY_URL) {
   process.exit(1);
 }
 
-const TOOLS: Tool[] = [
+type JsonValue = string | number | boolean | null | JsonValue[] | { [k: string]: JsonValue };
+
+interface ToolDef {
+  name: string;
+  description: string;
+  inputSchema: JsonValue;
+}
+
+const TOOLS: ToolDef[] = [
   {
     name: 'search',
     description: 'Keyword search over brain pages (Postgres full-text). Returns ranked matches with slug + snippet. Use for fast exact-term lookup; for semantic queries, prefer `query`.',
@@ -169,6 +192,9 @@ const TOOLS: Tool[] = [
 
 const TOOL_NAMES = new Set(TOOLS.map((t) => t.name));
 
+const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
+const SUPPORTED_PROTOCOL_VERSIONS = new Set(['2024-11-05', '2025-03-26', '2025-06-18']);
+
 async function callProxy(tool: string, args: Record<string, unknown>): Promise<{ ok: true; data: unknown } | { ok: false; error: string }> {
   let response: Response;
   try {
@@ -202,39 +228,176 @@ async function callProxy(tool: string, args: Record<string, unknown>): Promise<{
   return { ok: true, data: result };
 }
 
+interface JsonRpcRequest {
+  jsonrpc: '2.0';
+  id?: string | number | null;
+  method: string;
+  params?: Record<string, unknown>;
+}
+
+interface JsonRpcSuccess {
+  jsonrpc: '2.0';
+  id: string | number | null;
+  result: unknown;
+}
+
+interface JsonRpcError {
+  jsonrpc: '2.0';
+  id: string | number | null;
+  error: { code: number; message: string; data?: unknown };
+}
+
+function writeMessage(msg: JsonRpcSuccess | JsonRpcError): void {
+  // MCP stdio: newline-delimited JSON. Must hit stdout directly (not
+  // console.log — Bun's console.log can buffer / decorate).
+  process.stdout.write(JSON.stringify(msg) + '\n');
+}
+
+function ok(id: string | number | null, result: unknown): void {
+  writeMessage({ jsonrpc: '2.0', id, result });
+}
+
+function err(id: string | number | null, code: number, message: string, data?: unknown): void {
+  writeMessage({ jsonrpc: '2.0', id, error: { code, message, ...(data !== undefined ? { data } : {}) } });
+}
+
+async function handleMessage(raw: string): Promise<void> {
+  let msg: JsonRpcRequest;
+  try {
+    msg = JSON.parse(raw) as JsonRpcRequest;
+  } catch (parseErr) {
+    err(null, -32700, `Parse error: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`);
+    return;
+  }
+
+  // JSON-RPC notifications have no `id`. They never get a response.
+  const isNotification = !('id' in msg) || msg.id === undefined;
+  const id = (msg.id ?? null) as string | number | null;
+  const method = msg.method;
+  const params = (msg.params ?? {}) as Record<string, unknown>;
+
+  // --- Lifecycle -----------------------------------------------------
+  if (method === 'initialize') {
+    const clientProtocol = typeof params.protocolVersion === 'string' ? params.protocolVersion : undefined;
+    const protocolVersion = clientProtocol && SUPPORTED_PROTOCOL_VERSIONS.has(clientProtocol)
+      ? clientProtocol
+      : DEFAULT_PROTOCOL_VERSION;
+    if (!isNotification) {
+      ok(id, {
+        protocolVersion,
+        capabilities: { tools: {} },
+        serverInfo: { name: 'gbrain', version: '1.0.0' },
+      });
+    }
+    return;
+  }
+
+  if (method === 'notifications/initialized' || method === 'initialized') {
+    // Notification — silent ack.
+    return;
+  }
+
+  if (method === 'ping') {
+    if (!isNotification) ok(id, {});
+    return;
+  }
+
+  // --- Tools ---------------------------------------------------------
+  if (method === 'tools/list') {
+    if (!isNotification) ok(id, { tools: TOOLS });
+    return;
+  }
+
+  if (method === 'tools/call') {
+    const toolName = typeof params.name === 'string' ? params.name : '';
+    const toolArgs = (params.arguments && typeof params.arguments === 'object' ? params.arguments : {}) as Record<string, unknown>;
+
+    if (!TOOL_NAMES.has(toolName)) {
+      if (!isNotification) {
+        ok(id, {
+          content: [{ type: 'text', text: `Unknown gbrain tool: ${toolName}. Known: ${[...TOOL_NAMES].join(', ')}` }],
+          isError: true,
+        });
+      }
+      return;
+    }
+
+    const proxyResult = await callProxy(toolName, toolArgs);
+    if (!proxyResult.ok) {
+      log(`tool=${toolName} error=${proxyResult.error}`);
+      if (!isNotification) {
+        ok(id, {
+          content: [{ type: 'text', text: `gbrain ${toolName} failed: ${proxyResult.error}` }],
+          isError: true,
+        });
+      }
+      return;
+    }
+
+    const text = typeof proxyResult.data === 'string' ? proxyResult.data : JSON.stringify(proxyResult.data, null, 2);
+    if (!isNotification) {
+      ok(id, { content: [{ type: 'text', text }] });
+    }
+    return;
+  }
+
+  // --- Unknown method ------------------------------------------------
+  if (!isNotification) {
+    err(id, -32601, `Method not found: ${method}`);
+  }
+}
+
 async function main(): Promise<void> {
-  const server = new Server({ name: 'gbrain', version: '1.0.0' }, { capabilities: { tools: {} } });
+  // Newline-delimited JSON-RPC framing. Buffer partial lines across chunks.
+  let buffer = '';
+  // Track in-flight handlers so we don't exit on stdin close while a
+  // proxy fetch is still pending (caught by smoke test: tools/call was
+  // dropped when stdin closed before the 60s-timeout fetch resolved).
+  let pending = 0;
+  let stdinClosed = false;
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
-
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
-    if (!TOOL_NAMES.has(name)) {
-      return {
-        content: [{ type: 'text' as const, text: `Unknown gbrain tool: ${name}. Known: ${[...TOOL_NAMES].join(', ')}` }],
-        isError: true,
-      };
+  const maybeExit = () => {
+    if (stdinClosed && pending === 0) {
+      log('stdin closed and no pending work — exiting');
+      process.exit(0);
     }
+  };
 
-    const result = await callProxy(name, (args as Record<string, unknown>) ?? {});
-    if (!result.ok) {
-      log(`tool=${name} error=${result.error}`);
-      return {
-        content: [{ type: 'text' as const, text: `gbrain ${name} failed: ${result.error}` }],
-        isError: true,
-      };
+  process.stdin.on('data', (chunk: Buffer | string) => {
+    buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+    let nl = buffer.indexOf('\n');
+    while (nl !== -1) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (line.length > 0) {
+        pending += 1;
+        handleMessage(line)
+          .catch((handleErr) => {
+            log(`handler crashed: ${handleErr instanceof Error ? handleErr.message : String(handleErr)}`);
+          })
+          .finally(() => {
+            pending -= 1;
+            maybeExit();
+          });
+      }
+      nl = buffer.indexOf('\n');
     }
-
-    const text = typeof result.data === 'string' ? result.data : JSON.stringify(result.data, null, 2);
-    return { content: [{ type: 'text' as const, text }] };
   });
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  process.stdin.on('end', () => {
+    stdinClosed = true;
+    maybeExit();
+  });
+
+  process.stdin.on('error', (e: Error) => {
+    log(`stdin error: ${e.message}`);
+    process.exit(1);
+  });
+
   log(`server started (${TOOLS.length} tools, proxy=${PROXY_URL})`);
 }
 
-main().catch((err) => {
-  log(`fatal: ${err instanceof Error ? err.message : String(err)}`);
+main().catch((mainErr) => {
+  log(`fatal: ${mainErr instanceof Error ? mainErr.message : String(mainErr)}`);
   process.exit(1);
 });
