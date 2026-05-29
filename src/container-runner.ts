@@ -21,7 +21,13 @@ import {
   TIMEZONE,
 } from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
-import { CONTAINER_HOST_GATEWAY, CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import {
+  CONTAINER_HOST_GATEWAY,
+  CONTAINER_RUNTIME_BIN,
+  hostGatewayArgs,
+  readonlyMountArgs,
+  stopContainer,
+} from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -519,8 +525,8 @@ async function buildContainerArgs(
   const oneCliConfigured = Boolean(ONECLI_URL && ONECLI_API_KEY);
   const directKeyForwarded = Boolean(
     providerContribution.env?.ANTHROPIC_API_KEY ||
-      providerContribution.env?.OPENAI_API_KEY ||
-      providerContribution.env?.GOOGLE_API_KEY,
+    providerContribution.env?.OPENAI_API_KEY ||
+    providerContribution.env?.GOOGLE_API_KEY,
   );
 
   if (oneCliConfigured) {

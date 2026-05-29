@@ -337,6 +337,21 @@ export class ClaudeProvider implements AgentProvider {
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
+      // LANE #61 — Accumulate assistant text blocks as a fallback for the
+      // `result` event. Observed on OpenRouter-backed sonnet-4-5: the final
+      // assistant turn contains a `text` content block AND a
+      // `redacted_thinking` block, both with stop_reason=end_turn. The SDK's
+      // synthesized `result.result` field comes back null in that case
+      // (likely because the SDK takes the LAST content block, which is
+      // redacted_thinking, not text). Without this fallback the poll-loop
+      // sees `text=null`, writes nothing to messages_out, and runs.outcome
+      // ends up null in agency-os despite the agent having actually replied.
+      //
+      // We collect text from every assistant message in the stream and use
+      // the most recent non-empty value if the SDK's own result.text is null.
+      // This is purely additive — when the SDK gives us a non-null result
+      // we still prefer it.
+      let lastAssistantText: string | null = null;
       for await (const message of sdkResult) {
         if (aborted) return;
         messageCount++;
@@ -346,8 +361,31 @@ export class ClaudeProvider implements AgentProvider {
 
         if (message.type === 'system' && message.subtype === 'init') {
           yield { type: 'init', continuation: message.session_id };
+        } else if (message.type === 'assistant') {
+          // Capture any text content for the LANE #61 fallback. The SDK's
+          // assistant message has `message.message.content[]` where each
+          // entry can be a text/thinking/tool_use block. We concatenate
+          // every text block in this turn — that's what the user-facing
+          // reply is.
+          const inner = (message as { message?: { content?: Array<{ type?: string; text?: string }> } }).message;
+          const blocks = inner?.content ?? [];
+          const collected = blocks
+            .filter((b) => b?.type === 'text' && typeof b.text === 'string' && b.text.length > 0)
+            .map((b) => b.text as string)
+            .join('');
+          if (collected.length > 0) {
+            lastAssistantText = collected;
+          }
         } else if (message.type === 'result') {
-          const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
+          const sdkText = 'result' in message ? (message as { result?: string }).result ?? null : null;
+          // LANE #61 fallback: when the SDK reports no text but we observed
+          // a non-empty assistant text in the stream, surface that instead
+          // so messages_out (and runs.outcome) get the actual reply.
+          let text = sdkText;
+          if ((text === null || text === '') && lastAssistantText !== null) {
+            log(`Result event text was empty; falling back to last assistant text (${lastAssistantText.length} chars) — LANE #61`);
+            text = lastAssistantText;
+          }
           yield { type: 'result', text };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };

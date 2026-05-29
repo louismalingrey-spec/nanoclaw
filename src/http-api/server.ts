@@ -246,7 +246,10 @@ async function triggerGroup(url: URL, req: IncomingMessage, res: ServerResponse)
     sendJson(res, 400, { error: 'invalid_body', details: 'run_id must be a non-empty string ≤128 chars' });
     return;
   }
-  if (skillSlugRaw !== undefined && (typeof skillSlugRaw !== 'string' || skillSlugRaw.length === 0 || skillSlugRaw.length > 128)) {
+  if (
+    skillSlugRaw !== undefined &&
+    (typeof skillSlugRaw !== 'string' || skillSlugRaw.length === 0 || skillSlugRaw.length > 128)
+  ) {
     sendJson(res, 400, { error: 'invalid_body', details: 'skill_slug must be a non-empty string ≤128 chars' });
     return;
   }
@@ -268,6 +271,24 @@ async function triggerGroup(url: URL, req: IncomingMessage, res: ServerResponse)
     return;
   }
 
+  // LANE #61 — Skill triggers must carry the markdown body. Without it the
+  // agent-runner's formatter falls back to the legacy V1 shape ([API TRIGGER]
+  // + raw input blob) and the agent receives no procedure to execute. The
+  // model then ends the turn with no text (`Result: (empty)`) and outcome is
+  // null — looks like an intermittent model bug but is actually a malformed
+  // trigger. Reject loud at the boundary so callers know to send skill_content
+  // (or drop the skill metadata entirely if they meant a legacy queue trigger).
+  const hasSkillSlug = typeof skillSlugRaw === 'string' && skillSlugRaw.length > 0;
+  const hasSkillContent = typeof skillContentRaw === 'string' && skillContentRaw.length > 0;
+  if (hasSkillSlug && !hasSkillContent) {
+    sendJson(res, 400, {
+      error: 'invalid_body',
+      details:
+        'skill_content is required when skill_slug is set (the agent-runner has no other source for the procedure body)',
+    });
+    return;
+  }
+
   const result = triggerAgentGroup({
     agent_group_id: id,
     dedup_key: dedupKey,
@@ -280,8 +301,7 @@ async function triggerGroup(url: URL, req: IncomingMessage, res: ServerResponse)
   });
 
   if ('error' in result) {
-    const status =
-      result.error === 'not_found' ? 404 : result.error === 'invalid_run_id' ? 409 : 500;
+    const status = result.error === 'not_found' ? 404 : result.error === 'invalid_run_id' ? 409 : 500;
     sendJson(res, status, { error: result.error });
     return;
   }
