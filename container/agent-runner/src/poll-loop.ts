@@ -231,7 +231,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName);
+      // LANE #55 — Skill triggers are one-shot. Tell processQuery to close
+      // the SDK stream as soon as the `result` event fires so the for-await
+      // loop can complete and we can exit the poll loop. Without this the
+      // Claude SDK keeps the push-based stream open indefinitely (waiting
+      // for the next chat turn) and the container only dies when the host
+      // 30-min ceiling killer reaps it — even though the response is
+      // already in messages_out 30s in.
+      const result = await processQuery(query, routing, processingIds, config.providerName, isSkillTrigger);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
@@ -264,6 +271,32 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // (e.g. stream closed unexpectedly).
     markCompleted(processingIds);
     log(`Completed ${ids.length} message(s)`);
+
+    // LANE #55 — Skill containers are one-shot. After the response is in
+    // messages_out (success path) or an error reply was written (catch
+    // path), exit gracefully so the host dispatcher's reconcile sweep
+    // (5s cadence) can harvest messages_out → runs.outcome and fire the
+    // outcome webhook to agency-os immediately. Without this the
+    // container sat idle in the poll loop until the 30-min ceiling
+    // killer reaped it, leaving the trigger→outcome latency at 30 min
+    // for a payload that was actually ready in ~30s.
+    //
+    // Defer if another api_trigger landed in messages_in during this
+    // iteration (rare — the dispatcher only writes one per run, and
+    // usually rotates sessions per group — but cheap to handle): the
+    // outer loop will process that batch next, then re-check on its
+    // way back here.
+    if (isSkillTrigger) {
+      const morePendingTriggers = getPendingMessages().filter(isApiTriggerMessage);
+      if (morePendingTriggers.length > 0) {
+        log(
+          `Skill response delivered, but ${morePendingTriggers.length} api_trigger(s) still pending — staying alive to drain`,
+        );
+        continue;
+      }
+      log('Skill response delivered — exiting poll loop for dispatcher to harvest outcome');
+      return;
+    }
   }
 }
 
@@ -310,6 +343,7 @@ async function processQuery(
   routing: RoutingContext,
   initialBatchIds: string[],
   providerName: string,
+  closeOnResult: boolean = false,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -427,6 +461,19 @@ async function processQuery(
         markCompleted(initialBatchIds);
         if (event.text) {
           dispatchResultText(event.text, routing);
+        }
+        // LANE #55 — Skill batches: close the SDK's push-based input
+        // stream so translateEvents() finishes iterating sdkResult and
+        // this for-await loop exits. Without this, the Claude SDK keeps
+        // the conversation open indefinitely waiting for the next user
+        // turn (the desired behaviour for chat), so processQuery would
+        // never return and the runner could never reach its post-loop
+        // exit check. Chat batches pass closeOnResult=false to preserve
+        // the warm-stream behaviour that avoids re-spawning the SDK
+        // subprocess between turns.
+        if (closeOnResult) {
+          log('Skill result delivered — ending query stream for graceful exit');
+          query.end();
         }
       }
     }

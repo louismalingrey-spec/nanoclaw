@@ -131,6 +131,90 @@ describe('poll loop integration', () => {
     expect(getContinuation('recording')).toBe('fresh-init-id');
   });
 
+  it('LANE #55: skill (api_trigger) batch exits the poll loop gracefully after result', async () => {
+    // After delivering the skill response the agent-runner must exit the
+    // poll loop so the host dispatcher's reconcile sweep can immediately
+    // harvest messages_out → runs.outcome and fire the outcome webhook.
+    // Without this, the container sits idle until the 30-min ceiling
+    // killer reaps it (gap of up to 30 min between "response ready" and
+    // "agency-os sees the outcome"). The test asserts the loop returns
+    // naturally (no abort, no timeout) AND that the response was written.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, content, trigger)
+         VALUES ('api-trigger-55a', 'system', datetime('now'), 'pending', ?, 1)`,
+      )
+      .run(
+        JSON.stringify({
+          type: 'api_trigger',
+          run_id: 'run-test-55a',
+          dedup_key: 'lane55-test-a',
+          priority: 'normal',
+          target_entity_id: null,
+          input: { _manual: true },
+          skill_slug: 'test-skill',
+          skill_version: 1,
+          skill_content: '# Test skill',
+        }),
+      );
+
+    const provider = new RecordingProvider();
+    const start = Date.now();
+    // No abort signal — the loop MUST terminate on its own (via the LANE #55
+    // exit path). A 3s timeout below would catch a regression where the
+    // loop fails to terminate.
+    const loopPromise = Promise.race([
+      runPollLoop({ provider, providerName: 'recording-55a', cwd: '/tmp' }),
+      new Promise<void>((_, reject) => setTimeout(() => reject(new Error('runPollLoop did not exit within 3s')), 3000)),
+    ]);
+
+    await loopPromise; // Must resolve, not reject
+
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeLessThan(3000);
+
+    // The response was dispatched to messages_out before exit
+    const out = getUndeliveredMessages();
+    expect(out.length).toBeGreaterThanOrEqual(1);
+    expect(JSON.parse(out[0].content).text).toBe('ok');
+
+    // Exactly one query was made (no follow-up re-entry attempts after exit)
+    expect(provider.calls).toHaveLength(1);
+  });
+
+  it('LANE #55: chat batch does NOT auto-exit after result (stays alive for next turn)', async () => {
+    // The exit behaviour must be scoped to skill triggers. Chat sessions
+    // depend on the warm-stream behaviour (keep the SDK subprocess alive
+    // between turns to avoid the ~few-seconds re-spawn + transcript
+    // reload). Asserts the loop is still running after the result event
+    // — i.e. it requires the 1s race to time out instead of resolving
+    // naturally.
+    insertMessage('m-chat-55b', { sender: 'Alice', text: 'hi there' }, { platformId: 'chan-1', channelType: 'discord' });
+
+    const provider = new RecordingProvider();
+    let resolvedNaturally = false;
+    const loopPromise = runPollLoop({ provider, providerName: 'recording-55b', cwd: '/tmp' }).then(
+      () => {
+        resolvedNaturally = true;
+      },
+      () => {
+        // ignore — test owns the lifecycle
+      },
+    );
+
+    // Wait for the result to be written, then give the loop another beat
+    // to (incorrectly) exit if the regression were present.
+    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await sleep(300);
+
+    expect(resolvedNaturally).toBe(false);
+
+    // Tear down: detach from the still-running loop. The afterEach
+    // closeSessionDb() will release resources; the dangling poll loop
+    // exits on next iteration when the DB connection errors.
+    await Promise.race([loopPromise, sleep(50)]);
+  });
+
   it('LANE #54: chat batch preserves prior continuation (no fresh-session reset)', async () => {
     // The skill-fresh logic must NOT touch normal chat flows. Resuming a
     // chat session is the whole point of session continuity.
