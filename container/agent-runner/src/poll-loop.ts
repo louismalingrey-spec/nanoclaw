@@ -46,6 +46,21 @@ function isMcpResponse(m: MessageInRow): boolean {
   }
 }
 
+/**
+ * True if this message is a synthetic api_trigger payload from the host
+ * dispatcher (LANE H V1.5 skill execution). Used to recognise skill batches
+ * so the poll-loop can start them on a fresh SDK session — see LANE #54.
+ */
+function isApiTriggerMessage(m: MessageInRow): boolean {
+  if (m.kind !== 'system') return false;
+  try {
+    const parsed = JSON.parse(m.content) as { type?: unknown };
+    return parsed?.type === 'api_trigger';
+  } catch {
+    return false;
+  }
+}
+
 export interface PollLoopConfig {
   provider: AgentProvider;
   /**
@@ -187,6 +202,23 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
+
+    // LANE #54 — Skill triggers (api_trigger) must NOT resume prior session
+    // history. Symptom diagnosed in prod: a session that had previously
+    // recorded a failed skill turn (e.g. "BRAIN_RECALL_FAILED" or a dry-run
+    // simulation written as assistant text) caused subsequent runs on the
+    // same session to silently emit `(empty)` results — the model pattern-
+    // matched the prior failure mode and either stayed in dry-run or
+    // refused to engage tools. Each skill execution is a one-shot task
+    // with no useful state to inherit; clear the continuation so the SDK
+    // spawns a fresh transcript. The new session_id will become the next
+    // continuation on the init event (overwriting the cleared row).
+    const isSkillTrigger = keep.some(isApiTriggerMessage);
+    if (isSkillTrigger && continuation) {
+      log(`Skill trigger detected — clearing prior continuation ${continuation} for fresh execution`);
+      continuation = undefined;
+      clearContinuation(config.providerName);
+    }
 
     const query = config.provider.query({
       prompt,
