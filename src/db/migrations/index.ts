@@ -14,6 +14,7 @@ import { migration014 } from './014-web-channel.js';
 import { migration015 } from './015-web-notifications.js';
 import { migration016 } from './016-http-api-runs.js';
 import { migration017 } from './017-api-trigger-dispatcher.js';
+import { migration018 } from './018-skill-dispatch.js';
 import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
 
@@ -39,6 +40,7 @@ const migrations: Migration[] = [
   migration015,
   migration016,
   migration017,
+  migration018,
 ];
 
 export function runMigrations(db: Database.Database): void {

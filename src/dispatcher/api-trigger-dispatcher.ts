@@ -44,6 +44,8 @@
  * failure we increment attempt_count and either re-queue (< MAX_ATTEMPTS) or
  * mark the run as error. The atomic claim ensures retry is not a double-spawn.
  */
+import { createHmac } from 'node:crypto';
+
 import { getActiveContainerCount, isContainerRunning, wakeContainer } from '../container-runner.js';
 import { getAgentGroup } from '../db/agent-groups.js';
 import { getDb } from '../db/connection.js';
@@ -51,7 +53,7 @@ import { createMessagingGroupAgent, getMessagingGroupAgentByPair } from '../db/m
 import { getSession } from '../db/sessions.js';
 import { log } from '../log.js';
 import { readEnvFile } from '../env.js';
-import { resolveSession, writeSessionMessage } from '../session-manager.js';
+import { openOutboundDb, resolveSession, writeSessionMessage } from '../session-manager.js';
 
 // ── Tunables ──────────────────────────────────────────────────────────
 
@@ -106,6 +108,15 @@ interface TrackedRun {
    *  before the reconcile sweep gets to inspect container_status — the
    *  container may not have flipped to 'running' on the very first tick. */
   startedAt: number;
+  /** Wall-clock ISO at which the dispatcher wrote the api_trigger system
+   *  message. Used as the cutoff for harvesting messages_out → outcome at
+   *  reconcile time (LANE H V1.5) so we don't pick up replies from a prior
+   *  run that shared this session. */
+  triggerWrittenAt: string;
+  /** Caller-supplied skill identity, surfaced into the outcome webhook
+   *  payload so agency-os can update its own runs row without re-joining. */
+  skillSlug: string | null;
+  skillVersion: number | null;
 }
 
 const state: DispatcherState = {
@@ -126,6 +137,11 @@ interface RunRow {
   input: string | null;
   attempt_count: number;
   created_at: string;
+  // LANE H V1.5 — null for legacy/non-skill triggers (which still work,
+  // they just don't get the structured SKILL EXECUTION REQUEST prompt).
+  skill_slug: string | null;
+  skill_version: number | null;
+  skill_content: string | null;
 }
 
 // ── Public surface ────────────────────────────────────────────────────
@@ -216,7 +232,8 @@ async function tick(): Promise<void> {
 function selectQueuedRuns(limit: number): RunRow[] {
   return getDb()
     .prepare(
-      `SELECT id, agent_group_id, dedup_key, priority, input, attempt_count, created_at
+      `SELECT id, agent_group_id, dedup_key, priority, input, attempt_count, created_at,
+              skill_slug, skill_version, skill_content
          FROM runs
         WHERE status = 'queued'
         ORDER BY
@@ -283,19 +300,29 @@ async function dispatchOne(run: RunRow): Promise<void> {
     // Write the run input as a 'system' message: the container's message-in
     // poll loop already handles kind='system' for synthetic injections. The
     // payload is a stable JSON shape the agent-runner can switch on.
+    //
+    // LANE H V1.5: include skill identity + markdown content inline so the
+    // formatter can build a [SKILL EXECUTION REQUEST] prompt. When all three
+    // skill_* fields are absent we keep the V1 shape — backward compat for
+    // legacy queue-action triggers that come without explicit skill metadata.
     const payload = parseInput(run.input);
+    const messageContent: Record<string, unknown> = {
+      type: 'api_trigger',
+      run_id: run.id,
+      dedup_key: run.dedup_key,
+      priority: run.priority,
+      target_entity_id: targetEntityId,
+      input: payload,
+    };
+    if (run.skill_slug) messageContent.skill_slug = run.skill_slug;
+    if (run.skill_version !== null) messageContent.skill_version = run.skill_version;
+    if (run.skill_content) messageContent.skill_content = run.skill_content;
+
     writeSessionMessage(agentGroup.id, session.id, {
       id: `api-trigger-${run.id}`,
       kind: 'system',
       timestamp: startedAt,
-      content: JSON.stringify({
-        type: 'api_trigger',
-        run_id: run.id,
-        dedup_key: run.dedup_key,
-        priority: run.priority,
-        target_entity_id: targetEntityId,
-        input: payload,
-      }),
+      content: JSON.stringify(messageContent),
       trigger: 1,
     });
 
@@ -334,6 +361,9 @@ async function dispatchOne(run: RunRow): Promise<void> {
       agentGroupId: agentGroup.id,
       targetEntityId,
       startedAt: Date.now(),
+      triggerWrittenAt: startedAt,
+      skillSlug: run.skill_slug,
+      skillVersion: run.skill_version,
     });
 
     // Persist the session id on the run so external observers (the agency-os
@@ -429,20 +459,176 @@ function reconcileFinished(): void {
     const errorMsg = stuck ? 'container_never_registered_within_24h' : null;
     const endedAt = new Date().toISOString();
 
+    // LANE H V1.5 — harvest the agent's reply text from messages_out for the
+    // window since this run's system message was written. Best-effort: any
+    // failure here (db locked, schema mismatch on legacy sessions) is logged
+    // and the run still closes out cleanly so the trackedRuns map doesn't
+    // leak.
+    let outcomeText: string | null = null;
+    if (!stuck) {
+      try {
+        outcomeText = harvestOutcomeText(tracked.agentGroupId, sessionId, tracked.triggerWrittenAt);
+      } catch (err) {
+        log.warn('Outcome harvest failed', { runId: tracked.runId, err });
+      }
+    }
+
     getDb()
       .prepare(
-        `UPDATE runs SET status = ?, ended_at = ?, error_message = ?
+        `UPDATE runs SET status = ?, ended_at = ?, error_message = ?, outcome = ?
            WHERE id = ? AND status = 'running'`,
       )
-      .run(status, endedAt, errorMsg, tracked.runId);
+      .run(status, endedAt, errorMsg, outcomeText, tracked.runId);
 
     recordEvent(tracked.runId, stuck ? 'error' : 'info', `run_${status}`, {
       session_id: sessionId,
       duration_ms: now - tracked.startedAt,
+      outcome_bytes: outcomeText ? outcomeText.length : 0,
+    });
+
+    // Fire the outcome webhook so agency-os can update its mirror runs row
+    // without polling. Fire-and-forget like the alert webhook.
+    void maybePostOutcomeWebhook({
+      runId: tracked.runId,
+      status,
+      errorMessage: errorMsg,
+      outcome: outcomeText,
+      startedAt: tracked.triggerWrittenAt,
+      endedAt,
+      skillSlug: tracked.skillSlug,
+      skillVersion: tracked.skillVersion,
+      sessionId,
+      agentGroupId: tracked.agentGroupId,
     });
 
     state.trackedRuns.delete(sessionId);
     state.targetLocks.delete(`${tracked.agentGroupId}::${tracked.targetEntityId ?? ''}`);
+  }
+}
+
+// ── Outcome harvest + webhook (LANE H V1.5) ──────────────────────────
+
+/**
+ * Read messages_out for the session written after the run's api_trigger
+ * landed, parse the JSON content payload (`{text: ...}` shape produced
+ * by the agent-runner), and concatenate the text into a single outcome
+ * blob.
+ *
+ * We bound the result to 64KB so a runaway agent reply doesn't blow up
+ * the runs.outcome column or the webhook body.
+ */
+function harvestOutcomeText(agentGroupId: string, sessionId: string, sinceIso: string): string | null {
+  const MAX_OUTCOME_BYTES = 64 * 1024;
+  let outDb: import('better-sqlite3').Database | null = null;
+  try {
+    outDb = openOutboundDb(agentGroupId, sessionId);
+    const rows = outDb
+      .prepare(
+        `SELECT timestamp, content FROM messages_out
+          WHERE timestamp >= ?
+          ORDER BY timestamp ASC, seq ASC`,
+      )
+      .all(sinceIso) as Array<{ timestamp: string; content: string }>;
+    if (rows.length === 0) return null;
+    const parts: string[] = [];
+    for (const row of rows) {
+      const txt = extractText(row.content);
+      if (txt) parts.push(txt);
+    }
+    if (parts.length === 0) return null;
+    const joined = parts.join('\n\n');
+    return joined.length > MAX_OUTCOME_BYTES ? joined.slice(0, MAX_OUTCOME_BYTES) + '\n…[truncated]' : joined;
+  } finally {
+    try {
+      outDb?.close();
+    } catch {
+      // best-effort
+    }
+  }
+}
+
+function extractText(rawContent: string): string | null {
+  if (!rawContent) return null;
+  try {
+    const parsed = JSON.parse(rawContent);
+    if (isRecord(parsed)) {
+      if (typeof parsed.text === 'string' && parsed.text.length > 0) return parsed.text;
+      // Fallback: agent reply could be a tool-result wrapper; surface the
+      // whole JSON so the operator can at least see what the container
+      // sent. Bound it before joining.
+      return JSON.stringify(parsed).slice(0, 2_000);
+    }
+    return null;
+  } catch {
+    // content wasn't JSON — assume it's plain text already
+    return rawContent;
+  }
+}
+
+interface OutcomeWebhookPayload {
+  runId: string;
+  status: string;
+  errorMessage: string | null;
+  outcome: string | null;
+  startedAt: string;
+  endedAt: string;
+  skillSlug: string | null;
+  skillVersion: number | null;
+  sessionId: string;
+  agentGroupId: string;
+}
+
+async function maybePostOutcomeWebhook(payload: OutcomeWebhookPayload): Promise<void> {
+  const env = readEnvFile(['AGENCY_OS_OUTCOME_WEBHOOK', 'AGENCY_OS_OUTCOME_SECRET']);
+  const webhookUrl = process.env.AGENCY_OS_OUTCOME_WEBHOOK ?? env.AGENCY_OS_OUTCOME_WEBHOOK;
+  if (!webhookUrl) {
+    log.debug('AGENCY_OS_OUTCOME_WEBHOOK not set — skipping outcome push', { runId: payload.runId });
+    return;
+  }
+  const secret = process.env.AGENCY_OS_OUTCOME_SECRET ?? env.AGENCY_OS_OUTCOME_SECRET;
+
+  const body = JSON.stringify({
+    run_id: payload.runId,
+    status: payload.status,
+    error_message: payload.errorMessage,
+    outcome: payload.outcome,
+    started_at: payload.startedAt,
+    ended_at: payload.endedAt,
+    skill_slug: payload.skillSlug,
+    skill_version: payload.skillVersion,
+    nanoclaw_session_id: payload.sessionId,
+    nanoclaw_agent_group_id: payload.agentGroupId,
+  });
+
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (secret) {
+    // HMAC-SHA256 of the body — agency-os webhook handler verifies this
+    // against AGENCY_OS_OUTCOME_SECRET (same shared secret on both sides).
+    // We send hex-encoded so the route can timingSafeEqual against a hex
+    // expected. Header name follows the agency-os webhook convention
+    // (`x-signature`), see src/lib/integrations/sendblue/webhook-verify.ts.
+    const sig = createHmac('sha256', secret).update(body).digest('hex');
+    headers['x-nanoclaw-signature'] = sig;
+  }
+
+  try {
+    const res = await fetch(webhookUrl, {
+      method: 'POST',
+      headers,
+      body,
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      log.warn('Outcome webhook returned non-2xx', {
+        url: webhookUrl,
+        status: res.status,
+        runId: payload.runId,
+      });
+    } else {
+      log.info('Outcome webhook posted', { runId: payload.runId, status: res.status });
+    }
+  } catch (err) {
+    log.error('Outcome webhook failed', { url: webhookUrl, runId: payload.runId, err });
   }
 }
 

@@ -267,6 +267,9 @@ describe('reconcileFinished', () => {
       targetEntityId: null,
       // Older than the 10s grace so reconcile picks it up immediately.
       startedAt: Date.now() - 30_000,
+      triggerWrittenAt: new Date(Date.now() - 30_000).toISOString(),
+      skillSlug: null,
+      skillVersion: null,
     });
     isContainerRunningMock.mockImplementation(() => false);
 
@@ -289,6 +292,9 @@ describe('reconcileFinished', () => {
       agentGroupId: 'ag-1',
       targetEntityId: null,
       startedAt: Date.now() - 30_000,
+      triggerWrittenAt: new Date(Date.now() - 30_000).toISOString(),
+      skillSlug: null,
+      skillVersion: null,
     });
     isContainerRunningMock.mockImplementation(() => true);
 
@@ -309,6 +315,9 @@ describe('reconcileFinished', () => {
       targetEntityId: null,
       // Spawned 100ms ago — inside the 10s grace window.
       startedAt: Date.now() - 100,
+      triggerWrittenAt: new Date(Date.now() - 100).toISOString(),
+      skillSlug: null,
+      skillVersion: null,
     });
     isContainerRunningMock.mockImplementation(() => false);
 

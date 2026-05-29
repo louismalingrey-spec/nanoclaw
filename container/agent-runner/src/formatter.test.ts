@@ -165,3 +165,106 @@ describe('stripInternalTags', () => {
     );
   });
 });
+
+/**
+ * LANE H V1.5 — api_trigger system messages.
+ *
+ * Covers both legacy shape (no skill_content → `[API TRIGGER] / Input: …`)
+ * and the new shape (skill_content present → `[SKILL EXECUTION REQUEST]`
+ * with INSTRUCTIONS inline). The behavior is the contract that agency-os'
+ * `/admin/skills/<id>/execute` flow depends on — without it the agent gets
+ * an opaque Input blob and returns `Result: (empty)`.
+ */
+describe('api_trigger system message formatting', () => {
+  it('legacy api_trigger (no skill_content) renders [API TRIGGER] with Input dump', () => {
+    insertMessage('s1', 'system', {
+      type: 'api_trigger',
+      run_id: 'run-abc-123',
+      dedup_key: 'manual:run-abc-123',
+      priority: 'normal',
+      target_entity_id: 'creator-9',
+      input: { action: 'send_imessage', body: 'hi' },
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('[API TRIGGER]');
+    expect(result).toContain('run_id: run-abc-123');
+    expect(result).toContain('dedup_key: manual:run-abc-123');
+    expect(result).toContain('priority: normal');
+    expect(result).toContain('target_entity_id: creator-9');
+    expect(result).toContain('Input:');
+    expect(result).toContain('send_imessage');
+    // Legacy shape must NOT have the SKILL marker.
+    expect(result).not.toContain('[SKILL EXECUTION REQUEST]');
+  });
+
+  it('skill_content present → renders [SKILL EXECUTION REQUEST] with inline INSTRUCTIONS', () => {
+    insertMessage('s1', 'system', {
+      type: 'api_trigger',
+      run_id: 'run-xyz-789',
+      dedup_key: 'manual:run-xyz-789',
+      priority: 'normal',
+      target_entity_id: null,
+      input: { _manual: true, _dry_run: true, query: 'Polsia campaign' },
+      skill_slug: 'brain_recall_test',
+      skill_version: 1,
+      skill_content:
+        '## Procédure\nCall mcp__gbrain__search with the query, return top 3 results.',
+    });
+    const result = formatMessages(getPendingMessages());
+
+    expect(result).toContain('[SKILL EXECUTION REQUEST]');
+    expect(result).toContain('skill: brain_recall_test (v1)');
+    expect(result).toContain('run_id: run-xyz-789');
+    expect(result).toContain('INSTRUCTIONS:');
+    expect(result).toContain('Call mcp__gbrain__search');
+    // Input dict is JSON-stringified single line (not pretty-printed)
+    expect(result).toMatch(/input:.*"_manual":\s*true/);
+    expect(result).toMatch(/input:.*"_dry_run":\s*true/);
+    // Trailing reminder paragraph must be present so the agent knows how
+    // to interpret _dry_run / _manual.
+    expect(result).toContain('Read INSTRUCTIONS above');
+    expect(result).toContain('_dry_run');
+    expect(result).toContain('_manual');
+    // Legacy [API TRIGGER] header should NOT be emitted when we route to
+    // the skill shape — otherwise the agent sees two competing headers.
+    expect(result).not.toContain('[API TRIGGER]');
+  });
+
+  it('missing skill_version falls back to (v?)', () => {
+    insertMessage('s1', 'system', {
+      type: 'api_trigger',
+      run_id: 'run-novers',
+      input: {},
+      skill_slug: 'some_skill',
+      skill_content: '## Procédure\nDo the thing.',
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('skill: some_skill (v?)');
+  });
+
+  it('empty skill_content string keeps the legacy [API TRIGGER] path', () => {
+    insertMessage('s1', 'system', {
+      type: 'api_trigger',
+      run_id: 'run-empty',
+      input: { foo: 'bar' },
+      skill_slug: 'ignored',
+      skill_version: 1,
+      skill_content: '',
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('[API TRIGGER]');
+    expect(result).not.toContain('[SKILL EXECUTION REQUEST]');
+  });
+
+  it('non-api_trigger system message still renders [SYSTEM RESPONSE]', () => {
+    insertMessage('s1', 'system', {
+      action: 'schedule_task',
+      status: 'ok',
+      result: { task_id: 't1' },
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('[SYSTEM RESPONSE]');
+    expect(result).toContain('Action: schedule_task');
+    expect(result).toContain('Status: ok');
+  });
+});
