@@ -215,6 +215,15 @@ function formatSystemMessage(msg: MessageInRow): string {
   // here. The agent should see the run_id (so it can correlate logs / write a
   // structured response) plus the actual input payload.
   if (content?.type === 'api_trigger') {
+    // LANE H V1.5: when the dispatcher includes a `skill_content` markdown
+    // body, emit the [SKILL EXECUTION REQUEST] prompt shape — the agent
+    // reads the procedure inline and follows it step-by-step rather than
+    // staring at an opaque `Input: {…}` blob (which was the V1 behavior
+    // that produced `Result: (empty)` for every manual exec).
+    if (typeof content.skill_content === 'string' && content.skill_content.length > 0) {
+      return formatSkillExecutionRequest(content);
+    }
+
     const lines = ['[API TRIGGER]'];
     if (content.run_id) lines.push(`run_id: ${content.run_id}`);
     if (content.dedup_key) lines.push(`dedup_key: ${content.dedup_key}`);
@@ -225,6 +234,40 @@ function formatSystemMessage(msg: MessageInRow): string {
   }
 
   return `[SYSTEM RESPONSE]\n\nAction: ${content.action || 'unknown'}\nStatus: ${content.status || 'unknown'}\nResult: ${JSON.stringify(content.result || null)}`;
+}
+
+/**
+ * Build the structured [SKILL EXECUTION REQUEST] prompt the agent sees
+ * inside the container. The shape is fixed by LANE H spec — the agent
+ * reads `INSTRUCTIONS` (the skill markdown body) and follows it.
+ *
+ * `input` is JSON-stringified and inlined so the agent can read its own
+ * input dict (the agency-os caller passes `{_manual: true, _dry_run:
+ * bool, ...}` plus skill-specific fields). The trailing paragraph is
+ * fixed; it tells the agent how to interpret the `_dry_run` / `_manual`
+ * flags consistently across skills.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function formatSkillExecutionRequest(content: any): string {
+  const slug = typeof content.skill_slug === 'string' ? content.skill_slug : 'unknown';
+  const version =
+    typeof content.skill_version === 'number' && Number.isFinite(content.skill_version)
+      ? `v${content.skill_version}`
+      : 'v?';
+  const lines: string[] = ['[SKILL EXECUTION REQUEST]', `skill: ${slug} (${version})`];
+  if (content.run_id) lines.push(`run_id: ${content.run_id}`);
+  if (content.target_entity_id) lines.push(`target_entity_id: ${content.target_entity_id}`);
+  lines.push('input: ' + JSON.stringify(content.input ?? {}));
+  lines.push('');
+  lines.push('INSTRUCTIONS:');
+  lines.push(String(content.skill_content));
+  lines.push('');
+  lines.push(
+    'Read INSTRUCTIONS above, follow the Procédure step-by-step, honour ' +
+      'input flags (_dry_run = produce structured output without side-effects, ' +
+      '_manual = founder-triggered), and respond with the final outcome.',
+  );
+  return lines.join('\n');
 }
 
 /**

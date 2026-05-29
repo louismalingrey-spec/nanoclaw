@@ -232,15 +232,57 @@ async function triggerGroup(url: URL, req: IncomingMessage, res: ServerResponse)
   }
   const priority: 'low' | 'normal' | 'high' = priorityRaw === 'low' || priorityRaw === 'high' ? priorityRaw : 'normal';
 
+  // LANE H V1.5 optional fields. Type-validated here, then trusted by the
+  // handler. `skill_content` has a soft 256KB cap so a runaway markdown
+  // can't blow past the 1MB body limit on its own and starve other fields
+  // — the spec assumes skill markdown ~5-50KB.
+  const SKILL_CONTENT_MAX = 256 * 1024;
+  const runIdRaw = body.run_id;
+  const skillSlugRaw = body.skill_slug;
+  const skillVersionRaw = body.skill_version;
+  const skillContentRaw = body.skill_content;
+
+  if (runIdRaw !== undefined && (typeof runIdRaw !== 'string' || runIdRaw.length === 0 || runIdRaw.length > 128)) {
+    sendJson(res, 400, { error: 'invalid_body', details: 'run_id must be a non-empty string ≤128 chars' });
+    return;
+  }
+  if (skillSlugRaw !== undefined && (typeof skillSlugRaw !== 'string' || skillSlugRaw.length === 0 || skillSlugRaw.length > 128)) {
+    sendJson(res, 400, { error: 'invalid_body', details: 'skill_slug must be a non-empty string ≤128 chars' });
+    return;
+  }
+  if (
+    skillVersionRaw !== undefined &&
+    (typeof skillVersionRaw !== 'number' || !Number.isInteger(skillVersionRaw) || skillVersionRaw < 1)
+  ) {
+    sendJson(res, 400, { error: 'invalid_body', details: 'skill_version must be a positive integer' });
+    return;
+  }
+  if (
+    skillContentRaw !== undefined &&
+    (typeof skillContentRaw !== 'string' || skillContentRaw.length > SKILL_CONTENT_MAX)
+  ) {
+    sendJson(res, 400, {
+      error: 'invalid_body',
+      details: `skill_content must be a string ≤${SKILL_CONTENT_MAX} bytes`,
+    });
+    return;
+  }
+
   const result = triggerAgentGroup({
     agent_group_id: id,
     dedup_key: dedupKey,
     input,
     priority,
+    run_id: typeof runIdRaw === 'string' ? runIdRaw : undefined,
+    skill_slug: typeof skillSlugRaw === 'string' ? skillSlugRaw : undefined,
+    skill_version: typeof skillVersionRaw === 'number' ? skillVersionRaw : undefined,
+    skill_content: typeof skillContentRaw === 'string' ? skillContentRaw : undefined,
   });
 
   if ('error' in result) {
-    sendJson(res, result.error === 'not_found' ? 404 : 500, { error: result.error });
+    const status =
+      result.error === 'not_found' ? 404 : result.error === 'invalid_run_id' ? 409 : 500;
+    sendJson(res, status, { error: result.error });
     return;
   }
   if ('duplicate' in result) {
