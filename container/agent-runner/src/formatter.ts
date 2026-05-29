@@ -220,8 +220,24 @@ function formatSystemMessage(msg: MessageInRow): string {
     // reads the procedure inline and follows it step-by-step rather than
     // staring at an opaque `Input: {…}` blob (which was the V1 behavior
     // that produced `Result: (empty)` for every manual exec).
-    if (typeof content.skill_content === 'string' && content.skill_content.length > 0) {
+    const hasSkillContent =
+      typeof content.skill_content === 'string' && content.skill_content.length > 0;
+    if (hasSkillContent) {
       return formatSkillExecutionRequest(content);
+    }
+
+    // LANE #61 — defense in depth. The HTTP API rejects skill triggers
+    // missing `skill_content` (see http-api/server.ts), but legacy rows
+    // already in messages_in and direct CLI test harnesses may bypass
+    // that check. When a stored api_trigger carries `skill_slug` (i.e.
+    // the caller meant to execute a skill) but no `skill_content`, the
+    // legacy V1 shape would hand the agent an empty-instructions prompt
+    // and the SDK turn ends with `Result: (empty)` — outcome=null in
+    // agency-os. Instead, surface the configuration error so the
+    // operator sees a clear failure message rather than silent nothing.
+    const hasSkillSlug = typeof content.skill_slug === 'string' && content.skill_slug.length > 0;
+    if (hasSkillSlug) {
+      return formatSkillContentMissingError(content);
     }
 
     const lines = ['[API TRIGGER]'];
@@ -247,6 +263,53 @@ function formatSystemMessage(msg: MessageInRow): string {
  * fixed; it tells the agent how to interpret the `_dry_run` / `_manual`
  * flags consistently across skills.
  */
+/**
+ * LANE #61 — Fallback prompt when an api_trigger has `skill_slug` (the
+ * caller intended a skill execution) but no `skill_content` (the markdown
+ * body the agent-runner needs to read). The HTTP API now rejects this
+ * shape at the boundary, but stored rows and legacy callers can still
+ * reach here. Without a clear instruction the model emits an empty turn
+ * (`Result: (empty)`) and outcome ends up null in agency-os, which made
+ * the original "intermittent text=null" symptom hard to debug.
+ *
+ * We instruct the model to respond with a single, fixed structured error
+ * string. That string lands in messages_out → runs.outcome via the normal
+ * harvest path, so the operator sees the configuration error explicitly
+ * instead of silent nothing.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function formatSkillContentMissingError(content: any): string {
+  const slug = typeof content.skill_slug === 'string' ? content.skill_slug : 'unknown';
+  const version =
+    typeof content.skill_version === 'number' && Number.isFinite(content.skill_version)
+      ? `v${content.skill_version}`
+      : 'v?';
+  const lines: string[] = [
+    '[SKILL EXECUTION REQUEST — MALFORMED]',
+    `skill: ${slug} (${version})`,
+  ];
+  if (content.run_id) lines.push(`run_id: ${content.run_id}`);
+  lines.push('input: ' + JSON.stringify(content.input ?? {}));
+  lines.push('');
+  lines.push(
+    'CONFIGURATION ERROR: this skill trigger arrived without a `skill_content` ' +
+      'markdown body. The agent-runner needs the procedure inline (it has no ' +
+      'on-disk skill registry) so there is no way to execute the skill.',
+  );
+  lines.push('');
+  lines.push(
+    'Respond with EXACTLY this single line and nothing else, no commentary, ' +
+      'no tool calls:',
+  );
+  lines.push('');
+  lines.push(
+    `SKILL_CONTENT_MISSING: skill_slug=${slug} ${version} triggered without skill_content. ` +
+      'Caller must include the full skill markdown body on the api_trigger payload. ' +
+      'See LANE #61.',
+  );
+  return lines.join('\n');
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function formatSkillExecutionRequest(content: any): string {
   const slug = typeof content.skill_slug === 'string' ? content.skill_slug : 'unknown';

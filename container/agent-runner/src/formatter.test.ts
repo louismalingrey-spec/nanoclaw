@@ -242,18 +242,61 @@ describe('api_trigger system message formatting', () => {
     expect(result).toContain('skill: some_skill (v?)');
   });
 
-  it('empty skill_content string keeps the legacy [API TRIGGER] path', () => {
+  it('LANE #61: skill_slug present with empty skill_content → MALFORMED error prompt', () => {
+    // Pre-LANE #61 this fell through to the legacy [API TRIGGER] shape, which
+    // handed the model an empty-instructions prompt → `Result: (empty)` →
+    // outcome=null in agency-os. We now surface the configuration error so
+    // the operator sees a clear failure message via runs.outcome.
     insertMessage('s1', 'system', {
       type: 'api_trigger',
       run_id: 'run-empty',
       input: { foo: 'bar' },
-      skill_slug: 'ignored',
+      skill_slug: 'brain-recall-test',
       skill_version: 1,
       skill_content: '',
     });
     const result = formatMessages(getPendingMessages());
+    expect(result).toContain('[SKILL EXECUTION REQUEST — MALFORMED]');
+    expect(result).toContain('skill: brain-recall-test (v1)');
+    expect(result).toContain('run_id: run-empty');
+    expect(result).toContain('CONFIGURATION ERROR');
+    expect(result).toContain('SKILL_CONTENT_MISSING');
+    // Must NOT be confused with a healthy skill exec or a legacy trigger.
+    expect(result).not.toContain('[SKILL EXECUTION REQUEST]\n');
+    expect(result).not.toContain('Read INSTRUCTIONS above');
+    expect(result).not.toContain('[API TRIGGER]');
+  });
+
+  it('LANE #61: skill_slug present with skill_content omitted → MALFORMED error prompt', () => {
+    // Same shape as the LANE #55 smoke test which surfaced the bug — caller
+    // sent skill_slug + skill_version but no skill_content field at all.
+    insertMessage('s1', 'system', {
+      type: 'api_trigger',
+      run_id: 'run-omitted',
+      input: { query: 'hello' },
+      skill_slug: 'brain-recall-test',
+      skill_version: 1,
+      // skill_content intentionally absent
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('[SKILL EXECUTION REQUEST — MALFORMED]');
+    expect(result).toContain('SKILL_CONTENT_MISSING');
+    expect(result).toContain('skill_slug=brain-recall-test');
+  });
+
+  it('LANE #61: no skill_slug AND no skill_content keeps legacy [API TRIGGER] path', () => {
+    // Pure legacy queue-action triggers (no skill metadata at all) must keep
+    // working — the agent reads action_type / target_entity_id and dispatches
+    // via the in-conversation playbook. Don't break this path.
+    insertMessage('s1', 'system', {
+      type: 'api_trigger',
+      run_id: 'run-legacy',
+      input: { action: 'send_imessage', body: 'hi' },
+    });
+    const result = formatMessages(getPendingMessages());
     expect(result).toContain('[API TRIGGER]');
     expect(result).not.toContain('[SKILL EXECUTION REQUEST]');
+    expect(result).not.toContain('MALFORMED');
   });
 
   it('non-api_trigger system message still renders [SYSTEM RESPONSE]', () => {
