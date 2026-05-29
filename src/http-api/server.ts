@@ -246,7 +246,10 @@ async function triggerGroup(url: URL, req: IncomingMessage, res: ServerResponse)
     sendJson(res, 400, { error: 'invalid_body', details: 'run_id must be a non-empty string ≤128 chars' });
     return;
   }
-  if (skillSlugRaw !== undefined && (typeof skillSlugRaw !== 'string' || skillSlugRaw.length === 0 || skillSlugRaw.length > 128)) {
+  if (
+    skillSlugRaw !== undefined &&
+    (typeof skillSlugRaw !== 'string' || skillSlugRaw.length === 0 || skillSlugRaw.length > 128)
+  ) {
     sendJson(res, 400, { error: 'invalid_body', details: 'skill_slug must be a non-empty string ≤128 chars' });
     return;
   }
@@ -298,8 +301,7 @@ async function triggerGroup(url: URL, req: IncomingMessage, res: ServerResponse)
   });
 
   if ('error' in result) {
-    const status =
-      result.error === 'not_found' ? 404 : result.error === 'invalid_run_id' ? 409 : 500;
+    const status = result.error === 'not_found' ? 404 : result.error === 'invalid_run_id' ? 409 : 500;
     sendJson(res, status, { error: result.error });
     return;
   }
