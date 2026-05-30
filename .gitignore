@@ -39,3 +39,11 @@ groups/*
 .nanoclaw/
 
 agents-sdk-docs
+
+# Local Mac-dev pollution — never tracked, never deployed.
+#   .claude/worktrees/  : Conductor / Claude Code session worktrees (per-session, ephemeral)
+#   leads-dashboard/    : sibling Vercel project that sometimes lives inside this dir during dev
+#   my-automations/     : personal one-off automation scripts unrelated to NanoClaw
+.claude/worktrees/
+leads-dashboard/
+my-automations/
